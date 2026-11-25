@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{BUFFER_READ, HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -455,6 +455,11 @@ impl DispatchProbe {
             return;
         }
         let Ok(index) = CLAIMED.fetch_update(Relaxed, Relaxed, |n| (n < 4).then_some(n + 1)) else { return };
+        // Title binding may give an alias of the clamp's inputs a UAV.
+        if !list.buffer_readable(source.0) || count.is_some_and(|(buffer, _)| !list.buffer_readable(buffer)) {
+            tracing::warn!(shader, address, "indirect probe cannot copy a source bound for writing");
+            return;
+        }
         let Some(readback) = DispatchReadback::record(list, source, bounded, count) else {
             tracing::warn!(shader, address, "could not record indirect dispatch argument probe");
             return;
@@ -510,6 +515,12 @@ fn clamp_into(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    // The clamp reads the argument buffers before the title binds its pipeline.
+    list.begin_command();
+    list.buffer_state(src.0, BUFFER_READ);
+    if let Some((count, _)) = count {
+        list.buffer_state(count, BUFFER_READ);
+    }
     let before = list.indirect_state(dst);
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
@@ -579,8 +590,8 @@ fn record_clamp_as(
     };
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
+    // count, scratch destination, and budget buffers. `src` and `count` are moved
+    // to `GENERIC_READ` by `clamp_into` while `dst`
     // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
     // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
     // earlier execution's reads of the scratch buffer; nothing else writes it.
@@ -718,7 +729,15 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
         GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    list.gather_slot(src, src_id, offset, spec)
+    if !list.buffer_can_gather(src) {
+        GATHER_NONE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let gathered = list.gather_slot(src, src_id, offset, spec)?;
+    // The prelude gathers before the real list, so prime its first state.
+    list.begin_command();
+    list.buffer_state(src, BUFFER_READ);
+    Some(gathered)
 }
 
 /// Since the last line: records that got no slot because they do not fit
@@ -997,6 +1016,8 @@ pub(crate) fn check_hit(
     // (common before and after every check).
     let common = D3D12_RESOURCE_STATE_COMMON;
     let spec = (kind, step, 1);
+    list.begin_command();
+    list.buffer_state(src.0, BUFFER_READ);
     if !record_clamp_as(c, &list.list, (&check.args, common), budget, src, None, spec, true) {
         return false;
     }
