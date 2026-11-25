@@ -499,6 +499,12 @@ info and above).
 
 ## Shader development workflow
 
+`VICTORY_WAVE_PAIRS=1` enables an optional translator fallback for a
+Wave32 adapter. Each host lane represents two logical console lanes in
+a compute group that fits one Wave64 and uses no shared memory. The native
+GPU tests cover first-active-lane selection and returning buffer atomics
+across both halves.
+
 The [Shader toolchain workflow](.github/workflows/shader-toolchain.yml) runs
 on shader and GPU pull requests and can be dispatched manually. It compiles
 a synthetic bindless TextureCube and TextureCubeArray shader with DXC and
