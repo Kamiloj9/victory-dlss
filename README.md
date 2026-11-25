@@ -18,13 +18,13 @@ SUPER confirmed presentation during startup. Stable world rendering and
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
 | Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
-| Series S presentation | A guarded capture verified the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. The short test stopped at the menu. |
-| World entry | Both runs stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
+| Series S presentation | A guarded capture showed the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. Two captured world frames had zero RGB and alpha in both source planes before composition. |
+| World entry | A local Series S diagnostic run reached the 500-draw marker before the memory guard stopped it. A FidelityFX compute shader used during world entry contains an ACCC part and no DXIL. Gameplay, character rendering, and world frame rate still need verification on this setup. |
 | Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
 | Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
 
-Both local diagnostics runs used a 4 MiB window grid, a 1,536 MiB indexed
+The two `f9fbd8d` runs used a 4 MiB window grid, a 1,536 MiB indexed
 texture budget, and experimental reserved buffers for some loose windows.
 The 2 GiB and 3 GiB runs began with 13.06 GiB and 13.73 GiB of available
 Windows commit, respectively. The earlier `bc5eef5` baseline recorded
