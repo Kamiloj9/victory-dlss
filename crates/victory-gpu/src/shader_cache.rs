@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DispatchContract, HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -155,7 +155,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -197,6 +197,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, match s.dispatch_contract { DispatchContract::None => 0, DispatchContract::Visibility => 1, DispatchContract::Prefilter => 2 });
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -270,6 +271,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let dispatch_contract = match r.word()? {
+        0 => DispatchContract::None,
+        1 if stage == HwStage::Cs => DispatchContract::Visibility,
+        2 if stage == HwStage::Cs => DispatchContract::Prefilter,
+        _ => return None,
+    };
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -316,6 +323,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     r.0.is_empty().then_some(HostShader {
         stage,
+        dispatch_contract,
         dxil,
         user_data,
         samplers,
@@ -331,9 +339,33 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_shader_preserves_dispatch_contract() {
+        let mut compute = shader();
+        compute.stage = HwStage::Cs;
+        for contract in [DispatchContract::None, DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert_eq!(decode(&encode(&compute)).unwrap().dispatch_contract, contract);
+        }
+        compute.stage = HwStage::Ps;
+        for contract in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert!(decode(&encode(&compute)).is_none());
+        }
+    }
+
+    #[test]
+    fn translation_fingerprint_includes_dispatch_contract_switches() {
+        let fingerprint = victory_shader::emit::translation_fingerprint();
+        for setting in [b"VICTORY_SPLIT_LDS=".as_slice(), b"VICTORY_SPLIT_PREFILTER="] {
+            assert!(fingerprint.windows(setting.len()).any(|part| part == setting));
+        }
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            dispatch_contract: DispatchContract::None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
