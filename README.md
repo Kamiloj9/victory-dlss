@@ -17,15 +17,16 @@ SUPER confirmed presentation during startup. Stable world rendering and
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
-| Boot and presentation | Three diagnostic runs recorded 1,352, 1,206, and 1,127 successful Presents before their memory guard stopped them. |
-| World entry | All three runs stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
-| Memory | In one 250 ms sample, descriptor creation requested 1.63 MiB of data and allocated 640 MiB of shared buffer windows. The 256 KiB grid reduced average allocation size but produced more windows and still reached the memory limit. The default grid is 4 MiB. A separate file-staging run reached 224 MiB of live window staging capacity with zero new shared window allocations before its last sample. |
+| Boot and presentation | The latest guarded run recorded 1,206 successful Presents before the memory guard stopped it. |
+| World entry | The latest tests stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
+| Memory | In the latest run, the 1536 MiB indexed texture budget held the sampled total of title-filled textures and mapped tiles near that limit. One 250 ms sample added 760 MiB of live logical texture allocations, mostly render targets and depth resources. Two later samples added 2.74 GiB of process private commit with almost flat live texture bytes. |
 
 The test binaries combined fork revision `d6628f8` with local shader fixes
-and experimental file-backed memory staging. The allocation figures are
-rounded buffer sizes. The historical reports below identify the source
-and hardware for each test. [Memory profiling PR #4](https://github.com/Kamiloj9/victory-fork/pull/4),
-[256 KiB follow-up](https://github.com/Kamiloj9/victory-fork/pull/4#pullrequestreview-6059501051)
+and experimental file-backed memory staging. The latest run used the 4 MiB
+window grid and the 2 GiB window admission limit for file staging. The
+historical reports below identify the source and hardware for each test.
+[Window profiling](https://github.com/Kamiloj9/victory-fork/pull/4),
+[File staging](https://github.com/Kamiloj9/victory-fork/pull/6)
 
 ### Recent changes
 
@@ -36,6 +37,8 @@ and hardware for each test. [Memory profiling PR #4](https://github.com/Kamiloj9
   The changes passed Windows tests. [PR #2](https://github.com/Kamiloj9/victory-fork/pull/2), [PR #3](https://github.com/Kamiloj9/victory-fork/pull/3)
 - Added opt-in memory sampling and attributed new shared buffer windows to
   their initiating call. [PR #4](https://github.com/Kamiloj9/victory-fork/pull/4)
+- Added optional file-backed staging for buffers and loose windows admitted
+  to VRAM. [PR #6](https://github.com/Kamiloj9/victory-fork/pull/6)
 
 ## Credits
 
@@ -447,6 +450,10 @@ any existing loose window. Backing bytes measure the allocated buffer sizes.
 Requested bytes cover sized requests that created a shared window. Descriptor
 creation and later refresh are counted separately. `file_window_staging_bytes`
 reports the logical size of live sparse staging for windows on the card.
+`host_texture_families` reports live and cumulative D3D12 texture counts
+and logical allocation sizes by shape or use. Reserved textures have zero
+bytes in these totals. `tiled_mapped_bytes` counts the tiles assigned from
+`tiled_heap_bytes`. The two tiled values overlap.
 
 | Variable | Effect |
 |----------|--------|
