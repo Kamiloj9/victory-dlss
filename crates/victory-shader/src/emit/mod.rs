@@ -417,6 +417,14 @@ pub fn emit(
                 }
             }
         }
+        // Keep this form opt-in until its output is verified on hardware.
+        if std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1") {
+            let again = paired_wave(c, native, p, io, res);
+            report("paired lanes", &again);
+            if let Ok((shader, Some(32))) = again {
+                return Ok(shader);
+            }
+        }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
@@ -537,6 +545,57 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// One full console wave in one host wave, with both logical lanes of each
+/// thread following the same control flow and their side effects guarded by EXEC.
+fn paired_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    const GROUP: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "paired lanes require one full console wave without shared memory",
+    };
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(GROUP);
+    };
+    if cs.threads.into_iter().try_fold(1u32, u32::checked_mul) != Some(64) || cs.lds_bytes() != 0 {
+        return Err(GROUP);
+    }
+    if let Some(inst) = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
+        let name = i.name();
+        matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+            || name.contains("barrier")
+            || matches!(i.fields, crate::gfx10::Fields::Smem { .. })
+                && (name.contains("store") || name.contains("atomic"))
+    }) {
+        return Err(ShaderError::Unsupported {
+            offset: inst.machine.offset,
+            what: "paired lanes with shared memory, a barrier or a scalar memory write",
+        });
+    }
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let count = wide.len();
+        wide.extend(st.exits.iter().enumerate().filter_map(|(b, exit)| {
+            let structure::LaneExit::Branch { when, .. } = exit else {
+                return None;
+            };
+            st.bools
+                .support(*when)
+                .iter()
+                .any(|a| !matches!(a, structure::Atom::Uniform(_)))
+                .then_some(b)
+        }));
+        if wide.len() == count {
+            return lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res));
+        }
+    }
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
