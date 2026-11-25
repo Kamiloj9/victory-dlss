@@ -11,15 +11,18 @@ developer or publisher.
 
 ## Current status
 
-**Experimental.** The latest guarded Windows tests on an NVIDIA RTX 4080
-SUPER confirmed presentation during startup. Stable world rendering and
-30 fps in the world remain unverified on this setup.
+**Experimental.** Guarded Windows tests on an NVIDIA RTX 4080 SUPER showed
+the Series S account selector and reached the first 3D draw marker in
+Series X. Visible, sustained gameplay and 30 fps remain unverified on this
+setup.
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
 | Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
 | Series S presentation | A guarded capture showed the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. Two captured world frames had zero RGB and alpha in both source planes before composition. |
 | World entry | A guarded Series S run created host pipelines for two previously rejected geometry compute shaders. The scene depth readback shows people and world geometry. Both the scene color and the upscaler output had zero RGB at the sampled Present. A FidelityFX compute shader used during world entry contains an ACCC part and no DXIL. Visible gameplay and world frame rate still need verification. |
+| Series X world-entry marker | With file-backed guest pages and reserved buffer windows enabled in `e08a664`, the trace reached its first 500-draw marker at frame 1444. Presents for frames 1444 and 1445 followed. The Windows commit guard stopped the run before a world image was captured. [PR #21](https://github.com/Kamiloj9/victory-dlss/pull/21) |
+| KLBF Series S reference | A local test build based on KLBF `3c2dbec` added file-backed guest pages and reached the 500-draw marker. On the RTX, PC FSR 3.1.6 returned success while recording a 720p-to-1080p upscale dispatch. The frames captured around the marker were black. [KLBF main](https://github.com/PastiiJay/klbf-lab/tree/main) |
 | Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
 | Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
@@ -37,6 +40,12 @@ other forks.
 
 ### Recent changes
 
+- Added optional file-backed guest physical pages on native Windows.
+  [PR #19](https://github.com/Kamiloj9/victory-dlss/pull/19)
+- Resolve DirectStorage page destinations at submission so the worker
+  retains the intended backing pages. [PR #20](https://github.com/Kamiloj9/victory-dlss/pull/20)
+- Map reserved buffer windows according to the ranges their bindings cover.
+  [PR #21](https://github.com/Kamiloj9/victory-dlss/pull/21)
 - Synced both fxceless main branches through `d510ee4`. The FPS counter,
   indirect-record gathering, and changed-byte refresh are opt-in.
 - Added offline ACCC/FSPX parsing to `shader` and `translate`, adapted
