@@ -504,6 +504,13 @@ exhaust the volume or encounter I/O errors. Uploads wait for the GPU in 16 MiB
 batches and disk access may add latency. Temporary files are removed when their
 mappings are released.
 
+`VICTORY_SPARSE_WINDOWS=1` also enables reserved D3D12 buffers for admitted
+file-staged loose windows on adapters that support tiled resources. The GPU
+backing is mapped in 64 KiB tiles on demand. Bounded descriptor reads map the
+range they expose, and unbounded or writable uses can require the whole window.
+The regular staging path remains available if a reserved buffer cannot be
+created.
+
 `VICTORY_PHYSICAL_BACKING_DIR` separately enables sparse files for the title's
 physical page sections on native Windows. Use an existing writable directory
 outside the checkout. The volume must report enough free space for the full
