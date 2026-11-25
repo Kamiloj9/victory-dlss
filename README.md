@@ -17,16 +17,19 @@ SUPER confirmed presentation during startup. Stable world rendering and
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
-| Boot and presentation | The latest guarded run on local diagnostics revision `c827e4f` recorded 1,613 successful Presents before the memory guard stopped it after 53.3 seconds. |
-| World entry | The run stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
-| Memory | In the baseline (`bc5eef5`), one 250 ms sample added 760 MiB of live logical textures, mostly render targets and depth resources. Two later samples added 2.74 GiB of private commit with almost flat live texture bytes. The latest run sampled 48 MiB of reserved buffer address space, 20.25 MiB of mapped buffer tiles, and 32 MiB of tile heaps. The runs stopped at different points in loading, so these results cannot quantify the change in peak memory for the same workload. |
+| Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
+| World entry | Both runs stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
+| Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
+| Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
 
-The baseline recorded 1,206 successful Presents in 43.1 seconds. Both
-local diagnostics runs used a 4 MiB window grid, a 2 GiB file-staged window
-admission limit, and a 1,536 MiB indexed texture budget. The latest run
-enabled experimental reserved buffers for some loose windows. Historical
-reports below identify the source and hardware for results from other forks.
+Both local diagnostics runs used a 4 MiB window grid, a 1,536 MiB indexed
+texture budget, and experimental reserved buffers for some loose windows.
+The 2 GiB and 3 GiB runs began with 13.06 GiB and 13.73 GiB of available
+Windows commit, respectively. The earlier `bc5eef5` baseline recorded
+1,206 successful Presents in 43.1 seconds.
+Historical reports below identify the source and hardware for results from
+other forks.
 [Window profiling](https://github.com/Kamiloj9/victory-fork/pull/4),
 [File staging](https://github.com/Kamiloj9/victory-fork/pull/6),
 [Texture allocation counters](https://github.com/Kamiloj9/victory-fork/pull/7)
