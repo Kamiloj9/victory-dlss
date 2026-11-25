@@ -4379,6 +4379,69 @@ mod card_merge_tests {
     }
 
     #[test]
+    #[ignore = "requires native Windows and VICTORY_BACK_OWN_VIEW=1 in a fresh test process"]
+    fn file_backed_relay_writes_both_aliases_without_an_own_view() {
+        use crate::inplace::{Rig, back_own, title_memory_section, title_memory_view, views_gone, write_own};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Memory as mem;
+
+        const LEN: usize = 64 << 10;
+        assert!(back_own());
+        let directory = tempfile::tempdir().unwrap();
+        let file = victory_core::sparse_file::create(directory.path(), LEN as u64).unwrap();
+        // SAFETY: the live file is large enough for the mapping.
+        let section = unsafe {
+            let handle = mem::CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), mem::PAGE_READWRITE, 0, LEN as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            OwnedHandle::from_raw_handle(handle)
+        };
+        let handle = section.as_raw_handle();
+        title_memory_section(handle as usize, LEN as u64, false, true);
+        struct View(mem::MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                views_gone(self.0.Value as usize, LEN);
+                // SAFETY: a view created and owned by this test.
+                unsafe { mem::UnmapViewOfFile(self.0) };
+            }
+        }
+        let map = || {
+            // SAFETY: both views map one full live section.
+            let view = unsafe { mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, LEN) };
+            assert!(!view.Value.is_null());
+            title_memory_view(view.Value as usize, LEN, handle as usize, 0);
+            View(view)
+        };
+        let (a, b) = (map(), map());
+        let at = a.0.Value.cast::<u8>();
+        assert!(write_own(at as usize, &[99]).is_none());
+        // SAFETY: `a` is writable and the test holds the live view.
+        unsafe { at.add(2).write(9) };
+
+        let buffer = warp_buffer().expect("WARP buffer");
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: the buffer lives on the device the call returns.
+        unsafe { buffer.GetDevice(&mut device) }.unwrap();
+        let mut rig = Rig::new(&device.unwrap()).unwrap();
+        let bytes = [42, 0, 0, 0, 0, 0, 0, 7];
+        rig.store(&buffer, 0, &bytes).unwrap();
+        let gpu = rig.fetch(&buffer, 0, bytes.len()).unwrap();
+
+        let mut side = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, at as u64, LEN as u64);
+        shadow.card = Some(Card::new(CardStaging::Shared(buffer), 0));
+        assert_eq!(shadow.card_merge_relay(0, &gpu, 0, &mut Vec::new()), bytes.len());
+        for view in [&a, &b] {
+            // SAFETY: both views remain mapped for the read.
+            let merged = unsafe { view.0.Value.cast::<[u8; 8]>().read() };
+            assert_eq!(merged, [42, 0, 9, 0, 0, 0, 0, 7]);
+        }
+        drop((shadow, a, b));
+        drop((section, file));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn file_card_staging_preserves_title_bytes_unchanged_by_the_gpu() {
         let Some(buffer) = warp_buffer() else { return };
         let directory = tempfile::tempdir().unwrap();
