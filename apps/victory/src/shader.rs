@@ -42,12 +42,13 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let container = Container::parse(&data[offset..]).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: container.as_bytes(),
+        })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +225,27 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_sources_end_at_each_declared_container_boundary() {
+        let container = |marker: u8| {
+            let mut bytes = vec![0; 32];
+            bytes[..4].copy_from_slice(b"DXBC");
+            bytes[4] = marker;
+            bytes[24..28].copy_from_slice(&32u32.to_le_bytes());
+            bytes
+        };
+        let first = container(1);
+        let second = container(2);
+        let data = [b"prefix".as_slice(), &first, &second, b"trailing"].concat();
+        let found = sources(&data);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].bytes().unwrap().as_ref(), first);
+        assert_eq!(found[1].bytes().unwrap().as_ref(), second);
+    }
 }
