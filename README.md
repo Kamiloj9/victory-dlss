@@ -559,6 +559,14 @@ a compute group that fits one Wave64 and uses no shared memory. The native
 GPU tests cover first-active-lane selection and returning buffer atomics
 across both halves.
 
+On a Wave32 adapter, `VICTORY_SPLIT_LDS=1` enables the certified
+`CS_Visibility` translation for direct dispatches with one X group.
+`VICTORY_SPLIT_PREFILTER=1` enables `CS_AlphTransmissionPrefilterMip`
+for direct dispatches with one Z group and full 16×16 tiles. Both paths
+use a separate constant-buffer snapshot for each dispatch. Indirect
+dispatches for these translations are rejected because their GPU-produced
+group counts cannot be checked when recording the command list.
+
 The [Shader toolchain workflow](.github/workflows/shader-toolchain.yml) runs
 on shader and GPU pull requests and can be dispatched manually. It compiles
 a synthetic bindless TextureCube and TextureCubeArray shader with DXC and
