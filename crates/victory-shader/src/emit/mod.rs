@@ -1119,9 +1119,15 @@ mod tests {
     fn constant_color_validates() {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
-        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
+        let mut v = match super::validator::Validator::load(path.as_deref()) {
+            Ok(validator) => validator,
+            Err(error) if std::env::var_os("VICTORY_DXIL").is_some() => {
+                panic!("could not load the configured DXIL validator: {error}");
+            }
+            Err(_) => {
+                eprintln!("no dxil.dll; skipped");
+                return;
+            }
         };
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();

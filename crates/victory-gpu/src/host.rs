@@ -8601,7 +8601,19 @@ void main() {
     #[test]
     #[ignore = "requires WARP, a window VRAM budget and file staging"]
     fn warp_file_backed_loose_window_roundtrips_gpu_writes() {
+        if std::env::var_os("VICTORY_D3D12_GBV").is_some() {
+            assert!(std::env::var_os("VICTORY_D3D12_DEBUG").is_some());
+            let mut debug: Option<ID3D12Debug1> = None;
+            // SAFETY: this only queries the debug interface before device creation.
+            unsafe { D3D12GetDebugInterface(&mut debug) }.expect("GPU-based validation interface");
+            assert!(debug.is_some(), "GPU-based validation must be available");
+        }
+        let gpu = host().expect("the loose-window test needs a D3D12 host");
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            assert!(gpu.messages.is_some(), "the D3D12 debug layer must be enabled");
+        }
         check_title_gpu_roundtrip(true);
+        assert_eq!(gpu.log_messages(), None, "D3D12 reported a validation error");
     }
 
     fn check_title_gpu_roundtrip(loose_window: bool) {
@@ -8656,6 +8668,7 @@ void main() {
             assert!(std::sync::Arc::ptr_eq(&shadow, &again), "both bindings must keep the same backing");
         }
         if !shadow.carded() {
+            assert!(!loose_window, "the round trip needs a card-backed loose window");
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
