@@ -26,6 +26,44 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 use crate::shadow::WindowCaller;
 
+/// One heap pass's buffer reads. A sparse backing can keep gaps between
+/// verified views, while an uncertain view retains the bounding refresh.
+struct HeapBufferRanges {
+    bounding: (usize, usize),
+    exact: Option<Vec<(usize, usize)>>,
+}
+
+impl HeapBufferRanges {
+    fn new(from: usize, to: usize, exact: bool) -> Self {
+        Self {
+            bounding: (from, to),
+            exact: exact.then(|| vec![(from, to)]),
+        }
+    }
+
+    fn add(&mut self, from: usize, to: usize, exact: bool) {
+        self.bounding.0 = self.bounding.0.min(from);
+        self.bounding.1 = self.bounding.1.max(to);
+        if !exact {
+            self.exact = None;
+        } else if let Some(ranges) = &mut self.exact {
+            ranges.push((from, to));
+        }
+    }
+
+    fn refreshes(&mut self) -> &[(usize, usize)] {
+        match &mut self.exact {
+            Some(ranges) => {
+                if ranges.len() > 1 {
+                    crate::host::join_ranges(ranges, []);
+                }
+                ranges
+            }
+            None => std::slice::from_ref(&self.bounding),
+        }
+    }
+}
+
 fn dispatch_contract_allows(contract: DispatchContract, groups: [u32; 3]) -> bool {
     groups.contains(&0) || match contract {
         DispatchContract::None => true,
@@ -723,7 +761,7 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+pub(crate) fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -731,13 +769,19 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1, WindowCaller::RootView)?;
+    let caller = if srv { WindowCaller::RootView } else { WindowCaller::RootCbv };
+    let shadow = crate::shadow::find(address, 1, caller)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
+        let source = if srv {
+            crate::reserved_windows::RequestSource::Refresh
+        } else {
+            crate::reserved_windows::RequestSource::RootCbv
+        };
+        shadow.refresh_with_source(list, address, len, source);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -1682,7 +1726,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1708,7 +1752,7 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some((view, key)) = host.mirror_with_key(index, handle, true) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1735,20 +1779,31 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let Some(end) = address.checked_add(len) else { continue };
+            let srv_key = if matches!(view, View::Shader(..) | View::Placed(false, ..)) { key } else { 0 };
+            ranges.insert(index, (shadow, address, end, srv_key));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+        // Check the resource the slot actually retains. A cached range
+        // can survive several passes and the same slot can be remade.
+        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, HeapBufferRanges)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        let mut matches_slot = None;
+        for (&index, (shadow, from, to, srv_key)) in ranges.iter() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+            let (start, width) = shadow.span();
+            let exact = *srv_key != 0 && shadow.has_reserved_backing()
+                && *from >= start && *to - start <= width
+                && matches_slot.get_or_insert_with(|| host.matching_buffer_slots())(index, *srv_key, &shadow.buffer);
+            let (from, to) = (*from as usize, *to as usize);
+            spans.entry(key)
+                .and_modify(|(_, span)| span.add(from, to, exact))
+                .or_insert_with(|| (shadow.clone(), HeapBufferRanges::new(from, to, exact)));
         }
+        drop(matches_slot);
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let mut bytes = 0usize;
+        let mut skipped_gaps = 0usize;
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1759,7 +1814,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, ranges) in spans.values_mut() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1779,7 +1834,14 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            let bounding_bytes = ranges.bounding.1 - ranges.bounding.0;
+            let mut covered = 0;
+            for &(from, to) in ranges.refreshes() {
+                shadow.refresh(list, from as u64, (to - from) as u64);
+                covered += to - from;
+            }
+            bytes += covered;
+            skipped_gaps += bounding_bytes - covered;
         }
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
@@ -1796,6 +1858,7 @@ impl State {
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,
+                skipped_gap_mb = skipped_gaps >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
             );
@@ -3946,5 +4009,89 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+}
+
+#[cfg(test)]
+mod heap_buffer_range_tests {
+    use super::HeapBufferRanges;
+
+    #[test]
+    fn verified_srv_ranges_preserve_the_gap_and_merge_neighbors() {
+        let mut ranges = HeapBufferRanges::new(0x10000, 0x20000, true);
+        ranges.add(0x80000, 0x90000, true);
+        ranges.add(0x20000, 0x30000, true);
+        ranges.add(0x18000, 0x28000, true);
+        assert_eq!(ranges.refreshes(), &[(0x10000, 0x30000), (0x80000, 0x90000)]);
+    }
+
+    #[test]
+    fn a_single_uncertain_range_preserves_the_old_bounding_refresh() {
+        let mut ranges = HeapBufferRanges::new(0x10000, 0x20000, true);
+        ranges.add(0x80000, 0x90000, false);
+        ranges.add(0x50000, 0x60000, true);
+        assert_eq!(ranges.refreshes(), &[(0x10000, 0x90000)]);
+    }
+
+    #[test]
+    #[ignore = "requires a native tiled-resources adapter, sparse windows and file staging"]
+    fn native_bindless_srvs_do_not_refresh_the_tiles_between_them() {
+        use super::*;
+        use crate::{descriptor, object};
+
+        const TILE: usize = 64 << 10;
+        const WINDOW: usize = 4 << 20;
+        let host = crate::host::host().expect("native D3D12 host");
+        let mut memory = vec![0x6a_u8; 2 * WINDOW];
+        let aligned = memory.as_ptr().align_offset(WINDOW);
+        let title = &mut memory[aligned..aligned + WINDOW];
+        let start = title.as_mut_ptr() as u64;
+        let offsets = [TILE, 9 * TILE];
+        let contents = [0x1112_3344_u32, 0xa1b2_6cde];
+        let heap_iid = object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut title_heap = std::ptr::null();
+        let heap_desc = [0u32, 2, 1, 0, 0, 0, 0, 0];
+        assert_eq!(descriptor::create_heap(std::ptr::null(), heap_desc.as_ptr().cast(), &heap_iid, &mut title_heap), 0);
+        let heap = descriptor::heap(title_heap);
+        for (index, offset) in offsets.into_iter().enumerate() {
+            title[offset..offset + 4].copy_from_slice(&contents[index].to_le_bytes());
+            let mut resource = [0; 14];
+            resource[0] = 1;
+            resource[4] = 16;
+            let mut words = [0; 16];
+            words[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            words[6] = 4;
+            words[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+            let address = start + offset as u64;
+            words[10] = address as u32;
+            words[11] = (address >> 32) as u32;
+            descriptor::create_placed_srv(std::ptr::null(), &resource, &words, heap.handle(index as u32).unwrap());
+        }
+
+        let shadow = crate::shadow::find(start + offsets[0] as u64, 16, WindowCaller::DescriptorCreate).unwrap();
+        assert!(shadow.has_reserved_backing());
+        let readback = host.read_back_buffer(8).unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap]);
+        let before = crate::host::reserved_window_usage().0;
+        assert!(state.heap_buffers(&list).is_some());
+        for (index, offset) in offsets.into_iter().enumerate() {
+            // SAFETY: the source dword and readback slot are inside the allocated buffers.
+            unsafe { list.list.CopyBufferRegion(&readback, index as u64 * 4, &shadow.buffer, offset as u64, 4) };
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::host::reserved_window_usage().0 - before, (2 * TILE) as u64);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the synchronous submission initialized both dwords.
+        unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), 2), contents);
+            readback.Unmap(0, None);
+        }
+        assert!(host.log_messages().is_none());
+        object::release(title_heap);
     }
 }

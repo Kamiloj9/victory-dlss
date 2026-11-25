@@ -528,6 +528,7 @@ pub(crate) fn start_memory_timeline() {
                     let (working, private) = process_memory();
                     let (pipelines_made, pipelines_loaded) = crate::pipeline::frame_log_counts();
                     let frame = crate::frame::current();
+                    let (reserved_window_mapped_bytes, reserved_window_heap_bytes) = crate::host::reserved_window_usage();
                     tracing::info!(
                         frame,
                         private_bytes = private,
@@ -544,6 +545,10 @@ pub(crate) fn start_memory_timeline() {
                         requested_upload_bytes = crate::host::MADE[1].load(Relaxed),
                         requested_shared_bytes = crate::host::MADE[3].load(Relaxed),
                         file_window_staging_bytes = crate::shadow::WINDOW_FILE_STAGING.load(Relaxed),
+                        reserved_window_virtual_bytes = crate::shadow::RESERVED_WINDOW_BYTES.load(Relaxed),
+                        reserved_window_mapped_bytes,
+                        reserved_window_mapped_by_first_requester = ?crate::reserved_windows::mapped_by_source(),
+                        reserved_window_heap_bytes,
                         loose_windows = ?crate::shadow::window_activity(),
                         pipelines_made,
                         pipelines_loaded,

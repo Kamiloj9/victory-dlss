@@ -1969,6 +1969,12 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_with_key(index, handle, for_draw).map(|(view, _)| view)
+    }
+
+    /// Also returns the record generation so a cached range can be
+    /// compared with the host slot before it is refreshed.
+    pub(crate) fn mirror_with_key(&self, index: u32, handle: u64, for_draw: bool) -> Option<(View, u64)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2033,7 +2039,7 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return Some((view, key));
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -2046,7 +2052,7 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
         }
-        Some(view)
+        Some((view, key))
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2060,13 +2066,25 @@ impl HostHeap {
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
-    /// resource (diagnostics: a buffer view's slot must show the host copy
-    /// that is brought up to date for it).
+    /// resource (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// Check cached buffer bindings against a consistent snapshot of the
+    /// record generations and host resources. Lock in the same order as
+    /// `mirror_with_key`.
+    pub(crate) fn matching_buffer_slots(&self) -> impl Fn(u32, u64, &ID3D12Resource) -> bool + '_ {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        move |index, key, buffer| {
+            let index = index as usize;
+            key != 0 && made.get(index) == Some(&key)
+                && kept.get(index).and_then(Option::as_ref) == Some(buffer)
+        }
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -2504,6 +2522,9 @@ fn buffer_srv(
         );
         return None;
     }
+    // The actual view includes the adjusted first element, which can extend
+    // beyond the range of the lookup that selected this backing.
+    shadow.require_gpu_offsets(first * element, (first + u64::from(count)) * element, crate::reserved_windows::RequestSource::DescriptorSrv);
     // The console has no component mapping; one the host does not know is the default's.
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2607,6 +2628,8 @@ fn buffer_uav(
         );
         return None;
     }
+    // Bindless UAV use can have no corresponding GpuWrite step.
+    shadow.require_full_gpu_backing(crate::reserved_windows::RequestSource::DescriptorUav);
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -2767,6 +2790,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 BufferLocation: gpu,
                 SizeInBytes: size.next_multiple_of(256),
             };
+            let offset = shadow.offset(address);
+            shadow.require_gpu_offsets(offset, offset + u64::from(desc.SizeInBytes), crate::reserved_windows::RequestSource::DescriptorCbv);
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
