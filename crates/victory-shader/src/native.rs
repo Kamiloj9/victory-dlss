@@ -432,6 +432,261 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// Read native code from the usual DXIL part or an ACCC compute container.
+pub fn container_programs(c: &crate::Container) -> Result<Vec<NativeProgram>, ShaderError> {
+    if let Some(p) = c.part(crate::FourCC::DXIL) {
+        return native_programs(p.data);
+    }
+    if c.parts
+        .iter()
+        .filter(|p| p.fourcc == crate::FourCC::ACCC)
+        .count()
+        != 1
+        || c.parts
+            .iter()
+            .filter(|p| p.fourcc == crate::FourCC::RTS0)
+            .count()
+            != 1
+    {
+        return Err(Malformed("missing or duplicate ACCC or root part"));
+    }
+    let accc = c
+        .part(crate::FourCC::ACCC)
+        .ok_or(Malformed("no native shader part"))?;
+    let root = c
+        .part(crate::FourCC::RTS0)
+        .ok_or(Malformed("ACCC root signature missing"))?;
+    Ok(vec![accc_program(accc.data, root.data)?])
+}
+
+// The FSPX form seen in the console compute compiler. Unknown metadata is
+// rejected instead of inventing a root layout for executable code.
+fn accc_program(part: &[u8], root: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if part.get(..4) != Some(b"FSPX")
+        || u32_at(part, 4)? != 1
+        || u32_at(part, 12)? as usize != part.len()
+    {
+        return Err(Malformed("invalid FSPX header"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX chunk count"));
+    }
+    let table_end = 16usize
+        .checked_add(count * 16)
+        .ok_or(Malformed("FSPX table overflow"))?;
+    if table_end > part.len() {
+        return Err(Malformed("truncated FSPX table"));
+    }
+    let mut chunks = Vec::new();
+    for i in 0..count {
+        let at = 16 + 16 * i;
+        let kind = u32_at(part, at)?;
+        let start = u32_at(part, at + 4)? as usize;
+        let size = u32_at(part, at + 8)? as usize;
+        let end = start
+            .checked_add(size)
+            .ok_or(Malformed("FSPX chunk overflow"))?;
+        if u32_at(part, at + 12)? != 0
+            || start < table_end
+            || end > part.len()
+            || size == 0
+            || chunks
+                .iter()
+                .any(|&(k, s, e)| k == kind || (start < e && s < end))
+        {
+            return Err(Malformed("invalid or overlapping FSPX chunks"));
+        }
+        chunks.push((kind, start, end));
+    }
+    let chunk = |kind| {
+        chunks
+            .iter()
+            .find(|&&(k, _, _)| k == kind)
+            .map(|&(_, s, e)| &part[s..e])
+            .ok_or(Malformed("required FSPX chunk missing"))
+    };
+    let head = chunk(0)?;
+    let code = chunk(6)?;
+    let meta = chunk(7)?;
+    if head.len() != 28
+        || code.is_empty()
+        || code.len() % 4 != 0
+        || meta.len() < 24
+        || (meta.len() - 24) % 32 != 0
+    {
+        return Err(Malformed("invalid FSPX chunk size"));
+    }
+    let xy = u32_at(head, 12)?;
+    let z = u32_at(head, 16)?;
+    let flags = z >> 16;
+    if flags & !0x10 != 0 {
+        return Err(Malformed("unknown FSPX compute flags"));
+    }
+    let wave64 = flags & 0x10 == 0;
+    let vgprs = ((u32_at(head, 20)? & 63) + 1) * if wave64 { 4 } else { 8 };
+    let threads = [xy & 0xffff, xy >> 16, z & 0xffff];
+    let group_size = threads.into_iter().try_fold(1u32, u32::checked_mul);
+    if vgprs > 256 || threads[2] > 64 || threads.contains(&0)
+        || group_size.is_none_or(|size| size > 1024)
+    {
+        return Err(Malformed("invalid FSPX compute dimensions"));
+    }
+    let mut used = Vec::new();
+    let mut ended = false;
+    for e in meta[24..].chunks_exact(32) {
+        let tag = le32(e, 0);
+        if tag != 0x41 {
+            if !matches!(tag, 0x42 | 0x43) {
+                return Err(Malformed("unknown FSPX metadata record"));
+            }
+            ended = true;
+            continue;
+        }
+        if ended {
+            return Err(Malformed("noncontiguous FSPX resource records"));
+        }
+        let r = &e[4..24];
+        let kind = match r[0] {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            _ => return Err(Malformed("unknown FSPX resource type")),
+        };
+        if !matches!(r[1], 1 | 3) || !matches!(r[16], 2 | 4 | 8) {
+            return Err(Malformed("unknown FSPX resource layout"));
+        }
+        used.push(UsedResource {
+            kind,
+            root: RootType::from_raw(r[1].into()),
+            table_offset_dwords: le32(r, 4),
+            lower_bound: le32(r, 8),
+            stride: 0,
+            dwords: r[16],
+            user_data: r[17],
+            slot: r[18],
+        });
+    }
+    if u32_at(root, 0)? != 2 {
+        return Err(Malformed("unsupported FSPX root signature version"));
+    }
+    let params = u32_at(root, 4)? as usize;
+    if params == 0 || params > 64 {
+        return Err(Malformed("invalid FSPX root parameters"));
+    }
+    let at = u32_at(root, 8)? as usize;
+    if at
+        .checked_add(params * 12)
+        .is_none_or(|end| end > root.len())
+    {
+        return Err(Malformed("truncated FSPX root parameters"));
+    }
+    let mut next = 4u32;
+    let mut layout = Vec::new();
+    for slot in 0..params {
+        let pos = at + 12 * slot;
+        let data = u64::from(u32_at(root, pos + 8)?);
+        let root_type = u32_at(root, pos)?;
+        let records: Vec<_> = used.iter().filter(|u| u.slot as usize == slot).collect();
+        let (kind, sgprs) = match root_type {
+            0 => {
+                let table = bytes(root, data, 8).ok_or(Malformed("invalid FSPX root table"))?;
+                let ranges = u32_at(table, 0)?;
+                // This compiler's table layout has only been established for
+                // one contiguous, space-zero range with default flags and
+                // the append offset.
+                if ranges != 1 {
+                    return Err(Malformed("unsupported FSPX descriptor range"));
+                }
+                let range = bytes(root, u64::from(u32_at(table, 4)?), 24)
+                    .ok_or(Malformed("invalid FSPX descriptor range"))?;
+                let range_type = u32_at(range, 0)?;
+                let count = u32_at(range, 4)?;
+                let base = u32_at(range, 8)?;
+                if range_type > 3 || count == 0 || u32_at(range, 12)? != 0
+                    || u32_at(range, 16)? != 0 || u32_at(range, 20)? != u32::MAX
+                {
+                    return Err(Malformed("unsupported FSPX descriptor range"));
+                }
+                for u in &records {
+                    let expected = match u.kind {
+                        ResourceType::Srv => 0,
+                        ResourceType::Uav => 1,
+                        ResourceType::Cbv => 2,
+                        ResourceType::Sampler => 3,
+                        _ => return Err(Malformed("unsupported FSPX resource")),
+                    };
+                    let index = u.lower_bound.checked_sub(base)
+                        .ok_or(Malformed("FSPX register below range"))?;
+                    if range_type != expected || index >= count
+                        || index.checked_mul(8) != Some(u.table_offset_dwords)
+                    {
+                        return Err(Malformed("FSPX resource disagrees with table"));
+                    }
+                }
+                (RootType::Table, 1)
+            }
+            1 => {
+                let constants = bytes(root, data, 12).ok_or(Malformed("invalid FSPX root constants"))?;
+                if u32_at(constants, 4)? != 0 {
+                    return Err(Malformed("unsupported FSPX root constants space"));
+                }
+                (RootType::Constants, u32_at(constants, 8)?)
+            }
+            2..=4 => {
+                let descriptor = bytes(root, data, 12).ok_or(Malformed("invalid FSPX root descriptor"))?;
+                let register = u32_at(descriptor, 0)?;
+                if u32_at(descriptor, 4)? != 0 || u32_at(descriptor, 8)? != 0 || records.iter().any(|u| {
+                    let expected = match root_type {
+                        2 => ResourceType::Cbv,
+                        3 => ResourceType::Srv,
+                        _ => ResourceType::Uav,
+                    };
+                    u.kind != expected || u.lower_bound != register || u.table_offset_dwords != 0
+                }) {
+                    return Err(Malformed("FSPX resource disagrees with root descriptor"));
+                }
+                (RootType::Descriptor, 2)
+            }
+            _ => return Err(Malformed("unknown FSPX root type")),
+        };
+        let end = next.checked_add(sgprs).ok_or(Malformed("FSPX root SGPR overflow"))?;
+        if sgprs == 0 || end > 106 {
+            return Err(Malformed("invalid FSPX root SGPRs"));
+        }
+        let read = used.iter().find(|u| u.user_data == next as u8);
+        layout.push(RootParam {
+            root: kind,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: read.map_or(0, |u| u.lower_bound),
+            user_data: next as u8,
+            slot: slot as u8,
+        });
+        next = end;
+    }
+    if used.iter().any(|u| {
+        !layout
+            .iter()
+            .any(|p| p.slot == u.slot && p.user_data == u.user_data && p.root == u.root)
+    }) {
+        return Err(Malformed("FSPX resource has no matching root"));
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: vgprs as u16,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(head, 24)?,
+            threads,
+        }),
+        code: code.to_vec(),
+    })
+}
+
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     if blob.get(0..4) != Some(b"XBCH") {
         return Err(Malformed("native blob lacks XBCH magic"));
@@ -719,6 +974,71 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fspx_chunks_and_roots_are_checked() {
+        fn put(b: &mut [u8], at: usize, x: u32) {
+            b[at..at + 4].copy_from_slice(&x.to_le_bytes());
+        }
+        let mut p = vec![0u8; 160];
+        p[..4].copy_from_slice(b"FSPX");
+        put(&mut p, 4, 1);
+        put(&mut p, 8, 3);
+        put(&mut p, 12, 160);
+        for (i, (k, at, len)) in [(0, 64, 28), (6, 96, 4), (7, 104, 56)]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut p, 16 + i * 16, k);
+            put(&mut p, 20 + i * 16, at);
+            put(&mut p, 24 + i * 16, len);
+        }
+        put(&mut p, 76, 1 | (1 << 16));
+        put(&mut p, 80, 1);
+        put(&mut p, 128, 0x41);
+        p[132] = 2;
+        p[133] = 1;
+        p[148] = 2;
+        p[149] = 4;
+        let mut root = vec![0; 48];
+        put(&mut root, 0, 2);
+        put(&mut root, 4, 1);
+        put(&mut root, 8, 24);
+        put(&mut root, 24, 2);
+        put(&mut root, 32, 36);
+        let n = super::accc_program(&p, &root).unwrap();
+        assert_eq!(n.code.len(), 4);
+        assert_eq!(n.used.len(), 1);
+        let mut overlap = p.clone();
+        put(&mut overlap, 36, 88);
+        assert!(super::accc_program(&overlap, &root).is_err());
+        let mut duplicate = p.clone();
+        put(&mut duplicate, 32, 0);
+        assert!(super::accc_program(&duplicate, &root).is_err());
+        let mut truncated = p.clone();
+        put(&mut truncated, 12, 161);
+        assert!(super::accc_program(&truncated, &root).is_err());
+        assert!(super::accc_program(&p, &root[..20]).is_err());
+        let mut mismatch = root.clone();
+        put(&mut mismatch, 24, 3); // SRV root descriptor, but the record is a CBV.
+        assert!(super::accc_program(&p, &mismatch).is_err());
+        let mut table_root = vec![0; 68];
+        put(&mut table_root, 0, 2); put(&mut table_root, 4, 1);
+        put(&mut table_root, 8, 24); put(&mut table_root, 32, 36);
+        put(&mut table_root, 36, 1); put(&mut table_root, 40, 44);
+        put(&mut table_root, 44, 2); put(&mut table_root, 48, 1);
+        put(&mut table_root, 64, u32::MAX);
+        let mut table_p = p.clone(); table_p[133] = 3;
+        assert!(super::accc_program(&table_p, &table_root).is_ok());
+        put(&mut table_root, 44, 0); // SRV range does not contain CBVs.
+        assert!(super::accc_program(&table_p, &table_root).is_err());
+        put(&mut table_p, 128, 0x42); // A table with no matching resource row.
+        put(&mut table_root, 48, 0);
+        assert!(super::accc_program(&table_p, &table_root).is_err());
+        let mut overflow = root.clone();
+        put(&mut overflow, 24, 1); // Constants count overflows the SGPR sum.
+        put(&mut overflow, 44, u32::MAX);
+        assert!(super::accc_program(&p, &overflow).is_err());
+    }
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];

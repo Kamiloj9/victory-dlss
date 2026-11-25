@@ -11,7 +11,7 @@ use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
+    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, container_programs, ir,
 };
 use victory_shader::{io, resource};
 
@@ -420,17 +420,15 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("invalid DXBC container".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        let reason = if container.part(FourCC(*b"ACCC")).is_some() {
-            "no DXIL part (ACCC present)"
-        } else {
-            "no DXIL part"
-        };
-        return t.fail(reason.into(), example);
+    // DXIL carries the native layout in the same part. ACCC also needs RTS0,
+    // so two ACCC containers can share a payload and still have different layouts.
+    let code = if let Some(dxil) = container.part(FourCC::DXIL) {
+        blake3::hash(dxil.data)
+    } else if container.part(FourCC::ACCC).is_some() {
+        blake3::hash(container.as_bytes())
+    } else {
+        return t.fail("no DXIL part".into(), example);
     };
-    // `~`: the hash of the code alone; containers that differ only around
-    // it are translated once, the others listed as duplicates of it.
-    let code = blake3::hash(dxil);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
@@ -458,7 +456,7 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    let programs = match container_programs(&container) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };

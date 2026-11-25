@@ -94,9 +94,11 @@ impl Host {
                 if let Some(made) = &device {
                     let factory: IDXGIFactory4 =
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                    if let Ok(adapter) =
+                        factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
                         && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                        && (desc.Flags & 2 != 0
+                            || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
                         return Err("the default device is the software adapter".to_owned());
                     }
@@ -280,7 +282,10 @@ impl Host {
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    let bytes = std::slice::from_raw_parts(
+                        m.pDescription,
+                        m.DescriptionByteLength.saturating_sub(1),
+                    );
                     text.push_str(" | ");
                     text.push_str(&String::from_utf8_lossy(bytes));
                 }
@@ -353,9 +358,11 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: gs.as_ptr().cast(),
-                BytecodeLength: gs.len(),
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
             }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
@@ -1143,6 +1150,35 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
+            // Explicitly initialize outputs; keep upload resources until the fence.
+            let zero = |resource: &ID3D12Resource, size: Option<(u32, u32)>, words: u32| {
+                let source = match size {
+                    Some((w, h)) => {
+                        let pitch = (w * 4 * words).next_multiple_of(256);
+                        let source = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        list.CopyTextureRegion(
+                            &subresource(resource),
+                            0,
+                            0,
+                            0,
+                            &footprint_as(&source, w, h, words),
+                            None,
+                        );
+                        source
+                    }
+                    None => {
+                        let source = upload(&vec![0; words as usize])?;
+                        list.CopyBufferRegion(resource, 0, &source, 0, u64::from(words) * 4);
+                        source
+                    }
+                };
+                list.ResourceBarrier(&[transition(
+                    resource,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                Ok::<_, String>(source)
+            };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
@@ -1242,7 +1278,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
@@ -1256,6 +1292,7 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1267,9 +1304,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), 4)?);
                         let pitch = (w * 16).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1287,9 +1325,10 @@ impl Host {
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                 DXGI_FORMAT_R32_UINT,
                             ),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), 1)?);
                         let pitch = (w * 4).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1395,7 +1434,6 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
-                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
