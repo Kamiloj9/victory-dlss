@@ -235,6 +235,11 @@ Tools and diagnostics:
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
+- `VICTORY_MEMORY_TIMELINE=1` in a diagnostics build logs process private
+  commit and GPU resource counters every 250 ms, independently of frames.
+  With the memory map enabled, it requests extra walks at 4 and 2 GiB of
+  remaining commit. The resource bytes are logical sizes, and the active
+  pipeline library counts are loads, creates, stores and serializations.
 
 ### What this fork changed (summary)
 

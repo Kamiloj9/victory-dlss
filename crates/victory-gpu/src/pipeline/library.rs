@@ -247,6 +247,15 @@ static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// serialise), the pipeline, and since when (`crate::host::now_us`).
 static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new());
 
+/// Load, create, store and serialize calls currently inside the driver.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn active_library_calls() -> Option<[usize; 4]> {
+    let calls = CALLS.try_lock().ok()?;
+    Some(["load", "make", "store", "serialise"].map(|what| {
+        calls.iter().filter(|call| call.1 == what).count()
+    }))
+}
+
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
