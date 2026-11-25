@@ -558,14 +558,14 @@ fn twin_texture(
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
-            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
+            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, TextureFamily::DepthPlaneTwin))
         })
     } else {
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
     Some(std::sync::Arc::new(Twin {
-        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, TextureFamily::DepthColourTwin)),
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
@@ -1124,6 +1124,8 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
+    #[cfg(feature = "diagnostics")]
+    profile_family: Option<TextureFamily>,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
@@ -1370,7 +1372,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
-            None => HostTexture::new(texture, state),
+            None => HostTexture::new(texture, state, committed_family(&r.desc)),
         };
         host.filled = fills(&r.desc);
         if host.filled {
@@ -1929,6 +1931,98 @@ pub(crate) fn census() -> [u64; 10] {
 pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextureFamily {
+    Filled2dSingleMip,
+    Filled2dMipmapped,
+    Filled2dArray,
+    FilledOther,
+    RenderTarget,
+    DepthStencil,
+    ShaderWritable,
+    DepthColourTwin,
+    DepthPlaneTwin,
+    #[cfg(feature = "diagnostics")]
+    FilledReserved,
+}
+
+#[cfg(windows)]
+fn committed_family(desc: &ResourceDesc) -> TextureFamily {
+    use TextureFamily::*;
+    match (desc.flags & 7, desc.dimension, desc.depth_or_array_size, desc.mip_levels) {
+        (flags, _, _, _) if flags & 2 != 0 => DepthStencil,
+        (flags, _, _, _) if flags & 1 != 0 => RenderTarget,
+        (flags, _, _, _) if flags & 4 != 0 => ShaderWritable,
+        (_, 3, 1, 1) => Filled2dSingleMip,
+        (_, 3, 1, 2..) => Filled2dMipmapped,
+        (_, 3, 2.., _) => Filled2dArray,
+        _ => FilledOther,
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+const TEXTURE_FAMILIES: [TextureFamily; 10] = [
+    TextureFamily::Filled2dSingleMip,
+    TextureFamily::Filled2dMipmapped,
+    TextureFamily::Filled2dArray,
+    TextureFamily::FilledOther,
+    TextureFamily::RenderTarget,
+    TextureFamily::DepthStencil,
+    TextureFamily::ShaderWritable,
+    TextureFamily::DepthColourTwin,
+    TextureFamily::DepthPlaneTwin,
+    TextureFamily::FilledReserved,
+];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug)]
+struct TextureActivity {
+    created: u64,
+    created_bytes: u64,
+    live: u64,
+    live_bytes: u64,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl TextureActivity {
+    const EMPTY: Self = Self { created: 0, created_bytes: 0, live: 0, live_bytes: 0 };
+
+    fn created(&mut self, bytes: u64) {
+        self.created += 1;
+        self.created_bytes += bytes;
+        self.live += 1;
+        self.live_bytes += bytes;
+    }
+
+    fn released(&mut self, bytes: u64) {
+        self.live -= 1;
+        self.live_bytes -= bytes;
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static TEXTURE_ACTIVITY: std::sync::Mutex<[TextureActivity; TEXTURE_FAMILIES.len()]> =
+    std::sync::Mutex::new([TextureActivity::EMPTY; TEXTURE_FAMILIES.len()]);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn profile_texture(family: TextureFamily, bytes: u64) -> Option<TextureFamily> {
+    if !crate::copystat::memory_timeline_enabled() {
+        return None;
+    }
+    let mut families = TEXTURE_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    families[family as usize].created(bytes);
+    Some(family)
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_activity() -> impl std::fmt::Debug {
+    let families = *TEXTURE_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    TEXTURE_FAMILIES.into_iter().zip(families)
+        .filter(|(_, row)| row.created != 0)
+        .collect::<Vec<_>>()
+}
+
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
 fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
@@ -1944,15 +2038,19 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, family: TextureFamily) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = family;
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
+            #[cfg(feature = "diagnostics")]
+            profile_family: profile_texture(family, bytes),
             filled: false,
             tiled: None,
         }
@@ -1970,6 +2068,8 @@ impl HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
+            #[cfg(feature = "diagnostics")]
+            profile_family: profile_texture(TextureFamily::FilledReserved, 0),
             filled: false,
             tiled: Some(tiled),
         }
@@ -1982,6 +2082,11 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if let Some(family) = self.profile_family {
+            let mut families = TEXTURE_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+            families[family as usize].released(self.bytes);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -2860,6 +2965,65 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_profile_distinguishes_sampling_shapes_and_gpu_targets() {
+        use super::{TextureFamily as F, committed_family};
+        let mut desc = texture(512, 512, 28, 1);
+        assert_eq!(committed_family(&desc), F::Filled2dSingleMip);
+        desc.mip_levels = 2;
+        assert_eq!(committed_family(&desc), F::Filled2dMipmapped);
+        desc.depth_or_array_size = 6;
+        assert_eq!(committed_family(&desc), F::Filled2dArray);
+        desc.dimension = 4;
+        assert_eq!(committed_family(&desc), F::FilledOther);
+        desc.flags = 4;
+        assert_eq!(committed_family(&desc), F::ShaderWritable);
+        desc.flags = 5;
+        assert_eq!(committed_family(&desc), F::RenderTarget);
+        desc.flags = 6;
+        assert_eq!(committed_family(&desc), F::DepthStencil);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn texture_activity_tracks_creation_and_release_separately() {
+        let mut activity = super::TextureActivity::EMPTY;
+        activity.created(256);
+        activity.created(0);
+        activity.released(256);
+        assert_eq!((activity.created, activity.created_bytes), (2, 256));
+        assert_eq!((activity.live, activity.live_bytes), (1, 0));
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires VICTORY_MEMORY_TIMELINE=1 and a D3D12 host"]
+    fn texture_profile_counts_a_live_host_texture_once_across_arc_clones() {
+        use super::{HostTexture, TEXTURE_ACTIVITY, committed_family, host_texture};
+        use std::sync::Arc;
+
+        assert!(crate::copystat::memory_timeline_enabled());
+        let desc = texture(32, 32, 28, 1);
+        let family = committed_family(&desc);
+        let row = || TEXTURE_ACTIVITY.lock().unwrap()[family as usize];
+        let before = row();
+        let resource = host_texture(&desc, 0, std::ptr::null()).expect("a host texture");
+        let texture = Arc::new(HostTexture::new(resource, 0, family));
+        let bytes = texture.bytes;
+        assert!(bytes > 0);
+        let other = Arc::clone(&texture);
+        drop(texture);
+        let held = row();
+        assert_eq!((held.created, held.live), (before.created + 1, before.live + 1));
+        assert_eq!(held.live_bytes, before.live_bytes + bytes);
+        drop(other);
+        let released = row();
+        assert_eq!(released.created, held.created);
+        assert_eq!(released.created_bytes, before.created_bytes + bytes);
+        assert_eq!((released.live, released.live_bytes), (before.live, before.live_bytes));
     }
 
     fn heap(size: u64) -> This {
