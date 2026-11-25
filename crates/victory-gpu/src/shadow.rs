@@ -85,7 +85,7 @@ struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    staging: CardStaging,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -101,6 +101,17 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+enum CardStaging {
+    Shared(ID3D12Resource),
+    File(crate::card_staging::Backing),
+}
+
+impl Card {
+    fn new(staging: CardStaging, size: u64) -> Self {
+        Self { staging, before: Mutex::default(), dirty: Mutex::default(), sent: Mutex::default(), size }
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -3176,10 +3187,28 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        let staging = match &card.staging {
+            CardStaging::Shared(buffer) => Some(buffer),
+            CardStaging::File(_) => None,
+        };
+        Some((staging, before, card.size))
+    }
+
+    /// Gets the mapped file's bytes for upload on the direct queue.
+    ///
+    /// SAFETY: the caller holds the submission lock while it reads. No
+    /// other thread or GPU operation may change these bytes in that time.
+    pub(crate) unsafe fn file_staging_bytes(&self, from: usize, to: usize) -> Option<&[u8]> {
+        let CardStaging::File(backing) = &self.card.as_ref()?.staging else { return None };
+        let len = to.checked_sub(from)?;
+        debug_assert!(to <= self.len as usize);
+        if to > self.len as usize { return None; }
+        // SAFETY: the live backing covers the checked range, and the caller
+        // synchronizes CPU users by the submission lock.
+        Some(unsafe { std::slice::from_raw_parts(backing.data().add(from), len) })
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -3530,29 +3559,14 @@ fn lookup(address: u64, len: u64, any: bool, caller: WindowCaller) -> Option<Arc
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
+        let (buffer, data, card) = registered_backing(key.0, len, size, big)?;
+        if card.is_some() {
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
@@ -3577,6 +3591,39 @@ fn lookup(address: u64, len: u64, any: bool, caller: WindowCaller) -> Option<Arc
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// Use file staging only for admitted card copies; otherwise retain the shared path.
+fn registered_backing(start: u64, len: u64, size: u64, big: bool) -> Option<(ID3D12Resource, *mut u8, Option<Card>)> {
+    let directory = big.then(crate::card_staging::directory).flatten();
+    let mut admitted = directory.map(|_| card_for(size));
+    if let Some(directory) = directory && admitted.as_ref().is_some_and(Option::is_some) {
+        match crate::card_staging::Backing::new(directory, size as usize) {
+            Ok(backing) => {
+                let buffer = admitted.take()??;
+                crate::host::name(&buffer, || format!("title buffer {start:#x}+{len:#x} on the card"));
+                let data = backing.data();
+                static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                ANNOUNCED.call_once(|| tracing::info!("registered card buffers use file-backed CPU staging"));
+                return Some((buffer, data, Some(Card::new(CardStaging::File(backing), size))));
+            }
+            Err(error) => tracing::warn!(%error, size, "could not map card staging file; using a shared buffer"),
+        }
+    }
+    let Some((shared, data)) = host().and_then(|host| host.shared_buffer(size)) else {
+        if admitted.is_some_and(|buffer| buffer.is_some()) { CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed); }
+        return None;
+    };
+    crate::host::name(&shared, || format!("title buffer {start:#x}+{len:#x}"));
+    let on_card = admitted.unwrap_or_else(|| card_for(size));
+    let (buffer, card) = match on_card {
+        Some(buffer) => {
+            crate::host::name(&buffer, || format!("title buffer {start:#x}+{len:#x} on the card"));
+            (buffer, Some(Card::new(CardStaging::Shared(shared), size)))
+        }
+        None => (shared, None),
+    };
+    Some((buffer, data, card))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3851,13 +3898,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, caller: WindowCal
     let (buffer, card) = match window_card_for(len) {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                size: len,
-            };
+            let card = Card::new(CardStaging::Shared(buffer), len);
             (on_card, Some(card))
         }
         None => (buffer, None),
@@ -4082,7 +4123,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
+    use super::{Card, CardStaging, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -4121,6 +4162,25 @@ mod card_merge_tests {
         }
     }
 
+    #[test]
+    fn file_card_staging_preserves_title_bytes_unchanged_by_the_gpu() {
+        let Some(buffer) = warp_buffer() else { return };
+        let directory = tempfile::tempdir().unwrap();
+        let mut title = vec![0u8; 64 << 10];
+        let backing = crate::card_staging::Backing::new(directory.path(), title.len()).unwrap();
+        let data = backing.data();
+        let mut shadow = Shadow::new(buffer, data, 0, title.as_mut_ptr() as u64, title.len() as u64);
+        // The test did not charge this buffer to the card admission budget.
+        shadow.card = Some(Card::new(CardStaging::File(backing), 0));
+        title[2] = 9;
+        let gpu = [42, 0, 0, 0, 0, 0, 0, 7];
+        assert_eq!(shadow.card_merge(0, &gpu, &mut Vec::new()), gpu.len());
+        assert_eq!(&title[..8], &[42, 0, 9, 0, 0, 0, 0, 7]);
+        // SAFETY: the test alone accesses the backing.
+        let staged = unsafe { shadow.file_staging_bytes(0, 8) }.unwrap();
+        assert_eq!(staged, &title[..8]);
+    }
+
     /// The mixed landing the fetch inside flights must survive, on a real
     /// copy in the card's memory and its merge (`Shadow::card_merge_relay`):
     /// flights 5, 6, 7 in the air; 5 lands the old way with the queue's
@@ -4148,7 +4208,7 @@ mod card_merge_tests {
             side[title_byte] = title[title_byte];
             let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
             shadow.card = Some(Card {
-                staging: staging.clone(),
+                staging: CardStaging::Shared(staging.clone()),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),

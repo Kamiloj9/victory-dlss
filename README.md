@@ -372,6 +372,16 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+On native Windows, `VICTORY_CARD_STAGING_DIR` enables experimental file-backed
+CPU staging for registered buffers admitted to VRAM. Set it to an existing,
+writable directory outside the checkout on a local volume supporting sparse
+files. Set `VICTORY_RELAY=0`, `VICTORY_LATE_WAIT=0`, and `VICTORY_QUEUE2=0`;
+otherwise this path stays off. File setup failures fall back to shared staging.
+The per-file free-space check does not reserve disk space: later writes can
+exhaust the volume or encounter I/O errors. Uploads wait for the GPU in 16 MiB
+batches and disk access may add latency. Temporary files are removed when their
+mappings are released.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)

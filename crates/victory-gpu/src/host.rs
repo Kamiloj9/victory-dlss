@@ -744,6 +744,48 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn file_card_upload_batches_ranges_and_reuses_space_after_completion() {
+        use super::{CARD_FILE_UPLOAD_BYTES, host};
+
+        let host = host().expect("file upload test requires a D3D12 host");
+        let size = CARD_FILE_UPLOAD_BYTES + 128;
+        let directory = tempfile::tempdir().unwrap();
+        let backing = crate::card_staging::Backing::new(directory.path(), size).unwrap();
+        let target = host.uav_buffer(size as u64).unwrap();
+        let back = host.read_back_buffer(size as u64).unwrap();
+        let mut upload = host.make_card_file_upload().unwrap();
+        // SAFETY: the test alone accesses this mapped file. Neither call
+        // to the uploader changes it or retains a reference to it.
+        let content = unsafe {
+            let content = std::slice::from_raw_parts_mut(backing.data(), size);
+            content[..64].fill(0x71);
+            content[64..CARD_FILE_UPLOAD_BYTES].fill(0x32);
+            content[CARD_FILE_UPLOAD_BYTES..].fill(0xb4);
+            content
+        };
+        host.card_file_upload(&mut upload, &target, 0, &content[..64]).unwrap();
+        assert_eq!((upload.next, upload.used), (0, 64));
+        host.card_file_upload(&mut upload, &target, 64, &content[64..]).unwrap();
+        assert_eq!((upload.next, upload.used), (1, 128));
+        host.flush_card_file_upload(&mut upload).unwrap();
+        assert_eq!((upload.next, upload.used), (2, 0));
+
+        let list = host.new_list().unwrap();
+        // SAFETY: both resources cover the range. Execute waits for the
+        // readback before the mapped bytes are read.
+        unsafe {
+            list.list.CopyBufferRegion(&back, 0, &target, 0, size as u64);
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let actual = std::slice::from_raw_parts(data.cast::<u8>(), size);
+            assert!(actual == content);
+            back.Unmap(0, None);
+        }
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1532,6 +1574,7 @@ struct CardWork {
     /// gives it back when its submission has run (`Host::card_done`), so
     /// that submissions sent ahead ([`late`]) each have their own.
     sync: Vec<Prelude>,
+    file_upload: Option<CardFileUpload>,
     /// After them, in the same submission: the compare of the declared
     /// ranges with their bytes from before. As `sync`.
     check: Vec<Prelude>,
@@ -1552,6 +1595,83 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+}
+
+/// A bounded uploader, reused only after its own fence completes.
+struct CardFileUpload {
+    buffer: ID3D12Resource,
+    data: usize,
+    list: Prelude,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    next: u64,
+    used: usize,
+}
+
+impl Drop for CardFileUpload {
+    fn drop(&mut self) {
+        // SAFETY: this event belongs to the uploader.
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.event); }
+    }
+}
+
+const CARD_FILE_UPLOAD_BYTES: usize = 16 << 20;
+
+impl Host {
+    fn make_card_file_upload(&self) -> windows::core::Result<CardFileUpload> {
+        let (buffer, data) = self.upload_buffer(CARD_FILE_UPLOAD_BYTES as u64)
+            .ok_or_else(windows::core::Error::empty)?;
+        let list = self.make_prelude().ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: plain device and event creation.
+        unsafe {
+            let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let event = CreateEventW(None, false, false, None)?;
+            Ok(CardFileUpload { buffer, data: data as usize, list, fence, event, next: 0, used: 0 })
+        }
+    }
+
+    fn card_file_upload(&self, upload: &mut CardFileUpload, dest: &ID3D12Resource, start: usize, bytes: &[u8]) -> windows::core::Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let count = (bytes.len() - offset).min(CARD_FILE_UPLOAD_BYTES - upload.used);
+            // SAFETY: a new batch follows the previous fence. The source
+            // and destination ranges fit the mappings and resources.
+            unsafe {
+                if upload.used == 0 {
+                    upload.list.0.Reset()?;
+                    upload.list.1.Reset(&upload.list.0, None)?;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), (upload.data as *mut u8).add(upload.used), count);
+                upload.list.1.CopyBufferRegion(dest, (start + offset) as u64, &upload.buffer, upload.used as u64, count as u64);
+            }
+            upload.used += count;
+            offset += count;
+            if upload.used == CARD_FILE_UPLOAD_BYTES {
+                self.flush_card_file_upload(upload)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_card_file_upload(&self, upload: &mut CardFileUpload) -> windows::core::Result<()> {
+        if upload.used == 0 { return Ok(()); }
+        upload.next = upload.next.checked_add(1).unwrap_or_else(|| fail(format_args!("file staging fence exhausted")));
+        // SAFETY: the current batch holds live resources through this wait.
+        unsafe {
+            upload.list.1.Close()?;
+            self.queue.ExecuteCommandLists(&[Some(upload.list.1.cast()?)]);
+            self.queue.Signal(&upload.fence, upload.next)?;
+            upload.fence.SetEventOnCompletion(upload.next, upload.event)?;
+            let wait = WaitForSingleObject(upload.event, INFINITE);
+            let completed = upload.fence.GetCompletedValue();
+            if wait != windows::Win32::Foundation::WAIT_OBJECT_0 || completed == u64::MAX || completed < upload.next {
+                fail(format_args!("file staging wait failed: status {:#x}, completed {completed:#x}, expected {:#x}", wait.0, upload.next));
+            }
+            self.device.GetDeviceRemovedReason()?;
+        }
+        upload.used = 0;
+        Ok(())
+    }
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -3910,6 +4030,7 @@ impl Host {
             })?;
             Ok(CardWork {
                 sync: vec![list()?],
+                file_upload: None,
                 check: vec![list()?],
                 fetch: list()?,
                 root,
@@ -4085,6 +4206,30 @@ impl Host {
                 }
             }
         }
+        // File-backed staging cannot be named by D3D12. Each batch finishes
+        // before the bounded upload memory is reused and before hashing.
+        for (shadow, ranges) in &dirty {
+            if shadow.card_sides().is_some_and(|(staging, _, _)| staging.is_none()) {
+                if late() || flown || relay() || crate::queue2::second().is_some() {
+                    fail(format_args!("file staging requires synchronous direct submissions"));
+                }
+                if work.file_upload.is_none() {
+                    work.file_upload = Some(self.make_card_file_upload().unwrap_or_else(|e| fail(format_args!("file staging uploader creation failed: {e}"))));
+                }
+                let upload = work.file_upload.as_mut().unwrap();
+                for &(start, end) in ranges {
+                    // SAFETY: the submission lock serializes the source.
+                    let bytes = unsafe { shadow.file_staging_bytes(start, end) }
+                        .unwrap_or_else(|| fail(format_args!("file-backed staging range is unavailable")));
+                    self.card_file_upload(upload, &shadow.buffer, start, bytes)
+                        .unwrap_or_else(|e| fail(format_args!("file-backed card upload failed: {e}")));
+                }
+            }
+        }
+        if let Some(upload) = &mut work.file_upload {
+            self.flush_card_file_upload(upload)
+                .unwrap_or_else(|e| fail(format_args!("file-backed card upload flush failed: {e}")));
+        }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
@@ -4111,7 +4256,7 @@ impl Host {
                         let copy = second.up.list()?;
                         let mut at = 0u64;
                         for (shadow, ranges) in &dirty {
-                            let Some((staging, _, _)) = shadow.card_sides() else {
+                            let Some((Some(staging), _, _)) = shadow.card_sides() else {
                                 continue;
                             };
                             for &(a, b) in ranges {
@@ -4153,9 +4298,11 @@ impl Host {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            match &landed {
-                                Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
-                                None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                            if let Some(staging) = staging {
+                                match &landed {
+                                    Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
+                                    None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                                }
                             }
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
@@ -4170,7 +4317,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !ranges.is_empty() && staging.is_some() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
