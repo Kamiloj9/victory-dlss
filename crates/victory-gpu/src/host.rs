@@ -7586,6 +7586,7 @@ struct Presenter {
     height: u32,
     format: DXGI_FORMAT,
     copy: HostList,
+    overlay: std::sync::OnceLock<Option<crate::present_overlay::PresentOverlay>>,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
@@ -7903,14 +7904,26 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        overlay: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, frame, overlay);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        overlay: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7940,6 +7953,7 @@ impl Host {
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
+                    p.overlay.take();
                     tracing::info!(
                         width,
                         height,
@@ -7955,6 +7969,35 @@ impl Host {
                 }
             }
         }
+        let overlay = overlay.and_then(|(plane, state)| {
+            // SAFETY: the queue retains the host resource through this present.
+            let desc = unsafe { plane.GetDesc() };
+            if plane == texture
+                || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || desc.DepthOrArraySize != 1
+                || desc.SampleDesc.Count != 1
+                || desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+            {
+                return None;
+            }
+            let view = match desc.Format {
+                DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => desc.Format,
+                _ => return None,
+            };
+            let pass = p.overlay.get_or_init(|| {
+                match crate::present_overlay::PresentOverlay::new(&self.device, format) {
+                    Ok(pass) => Some(pass),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not initialize the PresentX overlay");
+                        None
+                    }
+                }
+            }).as_ref()?;
+            Some((pass, plane, view, D3D12_RESOURCE_STATES(state as i32)))
+        });
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -7969,7 +8012,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if overlay.is_none() && late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -7986,31 +8029,43 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
             list.CopyResource(&back, texture);
+            let mut back_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            if let Some((pass, plane, view, plane_state)) = overlay {
+                let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                if plane_state != readable {
+                    list.ResourceBarrier(&[transition(plane, plane_state, readable)]);
+                }
+                list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                pass.record(&self.device, list, &back, (width, height), plane, view);
+                if plane_state != readable {
+                    list.ResourceBarrier(&[transition(plane, readable, plane_state)]);
+                }
+                back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                #[cfg(feature = "diagnostics")]
+                {
+                    list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    back_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            let output = if overlay.is_some() { &back } else { texture };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, output))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, output) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            }
+            list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -8072,6 +8127,7 @@ impl Host {
                 height,
                 format,
                 copy,
+                overlay: std::sync::OnceLock::new(),
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
