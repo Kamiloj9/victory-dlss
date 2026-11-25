@@ -1087,14 +1087,15 @@ mod tests {
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
-        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // The tested WARP adapter lets the out-of-range sample through
+        // with depth disabled. ALWAYS and a zero write mask leave depth
+        // bounds as the only gate.
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
@@ -1133,10 +1134,10 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
