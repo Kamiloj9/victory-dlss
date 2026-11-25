@@ -3283,6 +3283,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH && max == 1 && let Some(stage) = p.stages.first() {
+            crate::indirect::DispatchProbe::record(
+                list, &stage.shader.hash, arguments, (&args.buffer, offset), (&bounded, at),
+                counter.as_ref().map(|(shadow, at)| (&shadow.buffer, shadow.offset(*at))),
+            );
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }

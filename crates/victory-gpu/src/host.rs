@@ -2041,6 +2041,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(feature = "diagnostics")]
+    dispatch_probes: Vec<crate::indirect::DispatchProbe>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3715,6 +3717,10 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    for probe in &list.deferred().dispatch_probes {
+        probe.report();
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -6908,6 +6914,11 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_dispatch_probe(&self, probe: crate::indirect::DispatchProbe) {
+        self.deferred().dispatch_probes.push(probe);
     }
 
     /// Brings a texture's staging buffer up to date when the list is
