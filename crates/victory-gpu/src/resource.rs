@@ -2141,6 +2141,19 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Retains an existing host texture selected by a diagnostic probe.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn existing_host_texture(address: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let live = textures();
+    if !live.contains(&address) {
+        return None;
+    }
+    // SAFETY: Resource::drop removes the address under the same lock.
+    let texture = unsafe { &*(address as *const Resource) };
+    let made = texture.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(copy, _)| copy.clone())
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]

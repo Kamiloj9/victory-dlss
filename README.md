@@ -19,7 +19,7 @@ SUPER confirmed presentation during startup. Stable world rendering and
 |------|------------------------|
 | Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
 | Series S presentation | A guarded capture showed the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. Two captured world frames had zero RGB and alpha in both source planes before composition. |
-| World entry | A local Series S diagnostic run reached the 500-draw marker before the memory guard stopped it. A FidelityFX compute shader used during world entry contains an ACCC part and no DXIL. Gameplay, character rendering, and world frame rate still need verification on this setup. |
+| World entry | A guarded Series S run created host pipelines for two previously rejected geometry compute shaders. The scene depth readback shows people and world geometry. Both the scene color and the upscaler output had zero RGB at the sampled Present. A FidelityFX compute shader used during world entry contains an ACCC part and no DXIL. Visible gameplay and world frame rate still need verification. |
 | Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
 | Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
@@ -31,9 +31,9 @@ Windows commit, respectively. The earlier `bc5eef5` baseline recorded
 1,206 successful Presents in 43.1 seconds.
 Historical reports below identify the source and hardware for results from
 other forks.
-[Window profiling](https://github.com/Kamiloj9/victory-fork/pull/4),
-[File staging](https://github.com/Kamiloj9/victory-fork/pull/6),
-[Texture allocation counters](https://github.com/Kamiloj9/victory-fork/pull/7)
+[Window profiling](https://github.com/Kamiloj9/victory-dlss/pull/4),
+[File staging](https://github.com/Kamiloj9/victory-dlss/pull/6),
+[Texture allocation counters](https://github.com/Kamiloj9/victory-dlss/pull/7)
 
 ### Recent changes
 
@@ -41,20 +41,20 @@ other forks.
   reaches the window. Based on [victory-perf](https://github.com/vitutu1/victory-perf/commit/c3faf2a86a28ca4258eed8402a193e14ab5ec41d)
   and the layout reported in [VIctory #1997](https://github.com/Marvisak/VIctory/pull/1997).
 - Synced the fxceless history through `0b0074e`, including descriptor mirroring,
-  shader updates, and optional submission and copy paths. [PR #1](https://github.com/Kamiloj9/victory-fork/pull/1)
+  shader updates, and optional submission and copy paths. [PR #1](https://github.com/Kamiloj9/victory-dlss/pull/1)
 - Imported frame timing and opt-in submission joining and copy-back changes
   from `3973179`. Fxceless reported 9.6 fps in the first rooms on an RTX
   4070 with its measured settings. Our guarded RTX 4080 SUPER runs still
   await world-entry verification. [Upstream report](https://github.com/fxceless/victory-fork/commit/39731795d2d5117e6f90939273ee130428d28137)
 - Ported KLBF Lab's empty pipeline-library fix and adapted its placed-texture
   refresh to recover missed remaps independently for each descriptor heap.
-  The changes passed Windows tests. [PR #2](https://github.com/Kamiloj9/victory-fork/pull/2), [PR #3](https://github.com/Kamiloj9/victory-fork/pull/3)
+  The changes passed Windows tests. [PR #2](https://github.com/Kamiloj9/victory-dlss/pull/2), [PR #3](https://github.com/Kamiloj9/victory-dlss/pull/3)
 - Added opt-in memory sampling and attributed new shared buffer windows to
-  their initiating call. [PR #4](https://github.com/Kamiloj9/victory-fork/pull/4)
+  their initiating call. [PR #4](https://github.com/Kamiloj9/victory-dlss/pull/4)
 - Added optional file-backed staging for buffers and loose windows admitted
-  to VRAM. [PR #6](https://github.com/Kamiloj9/victory-fork/pull/6)
+  to VRAM. [PR #6](https://github.com/Kamiloj9/victory-dlss/pull/6)
 - Added D3D12 texture allocation counters by resource family for the memory
-  timeline. [PR #7](https://github.com/Kamiloj9/victory-fork/pull/7)
+  timeline. [PR #7](https://github.com/Kamiloj9/victory-dlss/pull/7)
 
 ## Credits
 
@@ -557,6 +557,15 @@ reports the logical size of live sparse staging for windows on the card.
 and logical allocation sizes by shape or use. Reserved textures have zero
 bytes in these totals. `tiled_mapped_bytes` counts the tiles assigned from
 `tiled_heap_bytes`. The two tiled values overlap.
+
+For a Series S upscaler diagnosis, `VICTORY_CAPTURE_UPSCALER_INPUTS` names a
+local selector file. A runtime probe can publish `dispatch=<ordinal>`
+followed by one line per `color`, `depth`, `motion`, and `output` guest
+resource address in `role=0x<hex>` form. With `VICTORY_CAPTURE` enabled, the
+first listed Present with four matching live textures reads them in one
+submission. These are end-of-frame samples. The log reports measured pixel
+ranges and the PNGs visualize normalized values. Keep the selector and
+readbacks outside the repository.
 
 | Variable | Effect |
 |----------|--------|
