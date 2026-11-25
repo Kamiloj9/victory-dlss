@@ -136,7 +136,7 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes != 1 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -876,7 +876,7 @@ fn release_held_now(all: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, state, frame, None);
                             }
                         };
                         if all {
@@ -1096,12 +1096,80 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A PresentX plane has a 0x48-byte stride.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+    placements: *const [f32; 4],
+    color_space: u32,
+    flags: u32,
+    _rest: [u64; 3],
+}
+
+#[cfg(windows)]
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// # Safety
+/// The caller supplied a valid plane and its presentation arrays.
+#[cfg(windows)]
+unsafe fn plane_resource(plane: &Plane) -> Option<This> {
+    if plane.count != 1 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane has exactly one resource pointer.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null()).then_some(resource)
+}
+
+/// # Safety
+/// The optional arrays contain at least one entry.
+#[cfg(windows)]
+unsafe fn fullscreen_plane(plane: &Plane, width: i32, height: i32) -> bool {
+    // SAFETY: optional arrays owned by the caller; one resource was verified.
+    let source = unsafe { plane.source_rects.as_ref() };
+    let placement = unsafe { plane.placements.as_ref() };
+    source.is_none_or(|r| *r == [0, 0, 0, 0] || *r == [0, 0, width, height])
+        && placement.is_none_or(|r| *r == [0.0; 4] || *r == [0.0, 0.0, 1.0, 1.0])
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn present_plane_uses_the_console_array_stride() {
+    assert_eq!(std::mem::size_of::<Plane>(), 0x48);
+    assert_eq!(std::mem::offset_of!(Plane, resources), 0x10);
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn present_plane_fullscreen_checks_crop_and_placement() {
+    let resource: This = std::ptr::without_provenance(1);
+    let cropped = [1, 0, 3840, 2160];
+    let inset = [0.0, 0.0, 0.5, 1.0];
+    let mut plane = Plane {
+        token: 0,
+        count: 1,
+        resources: &resource,
+        source_rects: std::ptr::null(),
+        placements: std::ptr::null(),
+        color_space: 0,
+        flags: 0,
+        _rest: [0; 3],
+    };
+    // SAFETY: the referenced arrays have one valid entry.
+    unsafe {
+        assert_eq!(plane_resource(&plane), Some(resource));
+        assert!(fullscreen_plane(&plane, 3840, 2160));
+        plane.source_rects = &cropped;
+        assert!(!fullscreen_plane(&plane, 3840, 2160));
+        plane.source_rects = std::ptr::null();
+        plane.placements = &inset;
+        assert!(!fullscreen_plane(&plane, 3840, 2160));
+        plane.count = 0;
+        assert_eq!(plane_resource(&plane), None);
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1384,7 +1452,53 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The title presents its 4K interface over its 1080p game image.
+        // Keep both host resource handles alive through the synchronous
+        // composite and leave the resources in their previous states.
+        let overlay = (planes == 2 && plane.count == 1
+            && crate::console::current() == crate::console::Console::SeriesS)
+            .then(|| {
+                // SAFETY: the title supplied two plane descriptions and
+                // arrays for each plane's resources.
+                let second = unsafe { &*plane_parameters.add(1) };
+                let ui = unsafe { plane_resource(second) }.filter(|&ui| ui != resource)?;
+                let ui_texture = crate::resource::host_resource(ui)?.clone();
+                // SAFETY: the textures and the planes' first entries are live.
+                let full = unsafe {
+                    let base = texture.GetDesc();
+                    let top = ui_texture.GetDesc();
+                    fullscreen_plane(plane, base.Width as i32, base.Height as i32)
+                        && fullscreen_plane(second, top.Width as i32, top.Height as i32)
+                };
+                #[cfg(feature = "diagnostics")]
+                if crate::capture::listed(frame) {
+                    tracing::debug!(target: "victory_gpu::frame", frame, ui = ?ui, full,
+                        primary_flags = plane.flags, overlay_flags = second.flags,
+                        primary_color_space = plane.color_space, overlay_color_space = second.color_space,
+                        "Series S PresentX plane metadata");
+                }
+                // This path is for the default SDR planes with no extra
+                // presentation flags, as submitted by the Series S title.
+                use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+                let sdr = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709.0 as u32;
+                (full && plane.color_space == sdr && second.color_space == sdr
+                    && plane.flags == 0 && second.flags == 0)
+                    .then_some((ui, ui_texture))
+            })
+            .flatten();
+        let readable = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let overlay_state = overlay.as_ref().map(|(resource, _)| {
+            crate::resource::host_transition(*resource, readable).map_or(readable, |(_, before)| before)
+        });
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(frame) {
+            tracing::debug!(target: "victory_gpu::frame", frame, planes, primary = ?resource,
+                overlay = ?overlay.as_ref().map(|(resource, _)| resource), "PresentX sources");
+        }
+        let shown = host.present(texture, state, frame, overlay.as_ref().zip(overlay_state).map(|((_, texture), state)| (texture, state)));
+        if let Some(((resource, _), before)) = overlay.zip(overlay_state) {
+            crate::resource::host_transition(resource, before);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

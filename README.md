@@ -18,6 +18,7 @@ SUPER confirmed presentation during startup. Stable world rendering and
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
 | Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
+| Series S presentation | A guarded capture verified the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. The short test stopped at the menu. |
 | World entry | Both runs stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
 | Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
 | Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
@@ -36,6 +37,9 @@ other forks.
 
 ### Recent changes
 
+- Compose the two fullscreen SDR planes submitted by Series S so the UI
+  reaches the window. Based on [victory-perf](https://github.com/vitutu1/victory-perf/commit/c3faf2a86a28ca4258eed8402a193e14ab5ec41d)
+  and the layout reported in [VIctory #1997](https://github.com/Marvisak/VIctory/pull/1997).
 - Synced the fxceless history through `0b0074e`, including descriptor mirroring,
   shader updates, and optional submission and copy paths. [PR #1](https://github.com/Kamiloj9/victory-fork/pull/1)
 - Imported frame timing and opt-in submission joining and copy-back changes
@@ -425,8 +429,12 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
+The guarded Series S tests on a 32 GB RAM system require at least 12 GiB of
+available physical RAM and 12 GiB of Windows commit headroom before starting.
+These are test preflight thresholds. Stable gameplay requirements are still
+being measured. Check **Available** and **Committed** under **Task Manager →
+Performance → Memory**. Commit headroom is the difference between the limit
+and the committed amount. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
@@ -449,11 +457,12 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-Run the title:
+To select the Xbox Series S profile, pass `--console series-s` to the same
+title executable.
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+target\release\victory.exe run "<path to the title executable>" --execute --console series-s
 ```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
