@@ -475,14 +475,14 @@ fn process_memory() -> (u64, u64) {
 
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
-fn system_memory() -> (u64, u64) {
+fn system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
-    unsafe { GlobalMemoryStatusEx(&mut m) };
-    (m.ullAvailPhys, m.ullAvailPageFile)
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
 /// Whether the address space is walked for the memory map line
@@ -491,6 +491,73 @@ fn system_memory() -> (u64, u64) {
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+}
+
+fn schedule_memory_map() -> bool {
+    static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WALKING.swap(true, Relaxed) {
+        return false;
+    }
+    let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+        log_memory_map();
+        WALKING.store(false, Relaxed);
+    });
+    if walk.is_err() {
+        WALKING.store(false, Relaxed);
+        return false;
+    }
+    true
+}
+
+pub(crate) fn memory_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMELINE").is_some_and(|v| v == "1"))
+}
+
+/// Sample across long frames without relying on the thread that presents.
+pub(crate) fn start_memory_timeline() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if !memory_timeline_enabled() {
+            return;
+        }
+        let task = std::thread::Builder::new().name("victory-memory-timeline".into()).spawn(|| {
+            let mut map_at = 4 << 30;
+            loop {
+                if let Some((available_ram, commit_headroom)) = system_memory() {
+                    let (working, private) = process_memory();
+                    let (pipelines_made, pipelines_loaded) = crate::pipeline::frame_log_counts();
+                    let frame = crate::frame::current();
+                    tracing::info!(
+                        frame,
+                        private_bytes = private,
+                        working_set_bytes = working,
+                        available_ram_bytes = available_ram,
+                        commit_headroom_bytes = commit_headroom,
+                        logical_staging_bytes = crate::texture::staging_live_bytes(),
+                        logical_list_upload_bytes = crate::host::ALIVE[7].load(Relaxed),
+                        logical_scratch_bytes = crate::host::ALIVE[2].load(Relaxed),
+                        logical_host_texture_bytes = crate::resource::HOST_TEXTURES[1].load(Relaxed),
+                        requested_upload_bytes = crate::host::MADE[1].load(Relaxed),
+                        requested_shared_bytes = crate::host::MADE[3].load(Relaxed),
+                        loose_windows = ?crate::shadow::window_activity(),
+                        pipelines_made,
+                        pipelines_loaded,
+                        active_library_calls = ?crate::pipeline::active_library_calls(),
+                        "memory timeline"
+                    );
+                    if map_at > 0 && commit_headroom <= map_at && memory_map() && schedule_memory_map() {
+                        tracing::info!(frame, commit_headroom, threshold_bytes = map_at, "memory map requested by timeline");
+                        map_at = if map_at == 4 << 30 { 2 << 30 } else { 0 };
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        if let Err(error) = task {
+            tracing::warn!(%error, "memory timeline could not start");
+        }
+    });
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
@@ -684,7 +751,7 @@ fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
-    let (free, left) = system_memory();
+    let (free, left) = system_memory().unwrap_or_default();
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
@@ -704,15 +771,8 @@ fn log_memory() {
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
-    static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
-        let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
-            log_memory_map();
-            WALKING.store(false, Relaxed);
-        });
-        if walk.is_err() {
-            WALKING.store(false, Relaxed);
-        }
+    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 {
+        schedule_memory_map();
     }
     let kept = crate::pipeline::kept();
     tracing::info!(

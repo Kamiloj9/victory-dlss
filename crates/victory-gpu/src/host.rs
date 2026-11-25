@@ -589,6 +589,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::start_memory_timeline();
     crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -8475,7 +8477,7 @@ void main() {
             unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
         }
         crate::shadow::register(0x51_5151, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        let shadow = crate::shadow::find(title as u64, LEN as u64, crate::shadow::WindowCaller::Diagnostic).expect("a host copy");
         if !shadow.carded() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
@@ -8637,7 +8639,7 @@ void main() {
             unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
         }
         crate::shadow::register(0x52_5252, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        let shadow = crate::shadow::find(title as u64, LEN as u64, crate::shadow::WindowCaller::Diagnostic).expect("a host copy");
         if !shadow.carded() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;

@@ -787,6 +787,9 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
 }
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use library::active_library_calls;
 #[cfg(windows)]
 mod make;
 

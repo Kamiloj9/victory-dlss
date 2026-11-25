@@ -52,7 +52,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
-use crate::shadow::Shadow;
+use crate::shadow::{Shadow, WindowCaller};
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
@@ -141,9 +141,9 @@ impl Memory {
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
+        let Some(shadow) = crate::shadow::find(start, 1, WindowCaller::ShaderAddress)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
+            .or_else(|| crate::shadow::find(start, PAGE, WindowCaller::ShaderAddress).filter(whole))
         else {
             return;
         };

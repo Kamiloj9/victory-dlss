@@ -3473,8 +3473,8 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
-pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+pub(crate) fn find(address: u64, len: u64, caller: WindowCaller) -> Option<Arc<Shadow>> {
+    lookup(address, len, false, caller)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -3493,16 +3493,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (and copied) anew. Run 71, on a 256 KiB grid: 350 MB copied per frame
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
-pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
+pub(crate) fn find_any(address: u64, len: u64, caller: WindowCaller) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
     // nothing to choose: exactly `find`.
     if !fine() {
-        return find(address, len);
+        return find(address, len, caller);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, caller)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+fn lookup(address: u64, len: u64, any: bool, caller: WindowCaller) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3513,7 +3513,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, caller);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -3714,7 +3714,99 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+/// The caller that first allocates a loose window, or reuses one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowCaller {
+    RootView,
+    Geometry,
+    Indirect,
+    DescriptorCreate,
+    BindlessBuffer,
+    TableBuffer,
+    ShaderAddress,
+    Validation,
+    #[cfg(any(feature = "diagnostics", test))]
+    Diagnostic,
+}
+
+#[cfg(feature = "diagnostics")]
+const WINDOW_CALLERS: [WindowCaller; 9] = [
+    WindowCaller::RootView,
+    WindowCaller::Geometry,
+    WindowCaller::Indirect,
+    WindowCaller::DescriptorCreate,
+    WindowCaller::BindlessBuffer,
+    WindowCaller::TableBuffer,
+    WindowCaller::ShaderAddress,
+    WindowCaller::Validation,
+    WindowCaller::Diagnostic,
+];
+
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WindowActivity {
+    sized_new: u64,
+    sized_requested_bytes: u64,
+    sized_shared_bytes: u64,
+    unsized_new: u64,
+    unsized_shared_bytes: u64,
+    sized_hits: u64,
+    unsized_hits: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl WindowActivity {
+    fn record(&mut self, requested: Option<u64>, created: Option<u64>) {
+        match (requested, created) {
+            (Some(requested), Some(backing)) => {
+                self.sized_new += 1;
+                self.sized_requested_bytes += requested;
+                self.sized_shared_bytes += backing;
+            }
+            (None, Some(backing)) => {
+                self.unsized_new += 1;
+                self.unsized_shared_bytes += backing;
+            }
+            (Some(_), None) => self.sized_hits += 1,
+            (None, None) => self.unsized_hits += 1,
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static WINDOW_ACTIVITY: Mutex<[WindowActivity; WINDOW_CALLERS.len()]> =
+    Mutex::new([WindowActivity {
+        sized_new: 0,
+        sized_requested_bytes: 0,
+        sized_shared_bytes: 0,
+        unsized_new: 0,
+        unsized_shared_bytes: 0,
+        sized_hits: 0,
+        unsized_hits: 0,
+    }; WINDOW_CALLERS.len()]);
+
+impl WindowCaller {
+    fn record(self, requested: Option<u64>, created: Option<u64>) {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::memory_timeline_enabled() {
+            let mut rows = WINDOW_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+            rows[self as usize].record(requested, created);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (self, requested, created);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_activity() -> impl std::fmt::Debug {
+    let rows = *WINDOW_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    WINDOW_CALLERS.into_iter().zip(rows)
+        .filter(|(_, row)| row.sized_new != 0 || row.unsized_new != 0 || row.sized_hits != 0 || row.unsized_hits != 0)
+        .collect::<Vec<_>>()
+}
+
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, caller: WindowCaller) -> Option<Arc<Shadow>> {
+    let requested = (!unsized_ask).then_some(end - address);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -3741,6 +3833,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
+        caller.record(requested, None);
         return Some(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
@@ -3785,6 +3878,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    caller.record(requested, Some(len));
     Some(shadow)
 }
 
@@ -3867,6 +3961,22 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn window_activity_separates_requested_bytes_backing_and_reuse() {
+        let mut activity = super::WindowActivity::default();
+        activity.record(Some(32), Some(4096));
+        activity.record(None, Some(8192));
+        activity.record(Some(256), None);
+        activity.record(None, None);
+        assert_eq!(activity.sized_new, 1);
+        assert_eq!(activity.sized_requested_bytes, 32);
+        assert_eq!(activity.sized_shared_bytes, 4096);
+        assert_eq!(activity.unsized_new, 1);
+        assert_eq!(activity.unsized_shared_bytes, 8192);
+        assert_eq!((activity.sized_hits, activity.unsized_hits), (1, 1));
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
