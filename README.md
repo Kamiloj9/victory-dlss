@@ -1,22 +1,53 @@
-# VIctory fork (work in progress)
+# VIctory for Windows
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+compatibility layer for running an Xbox Series title on Windows from files
+the user supplies. This repository follows [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+and integrates reviewed rendering, shader, and memory-management fixes.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
+
+## Current status
+
+**Experimental.** The latest guarded Windows tests on an NVIDIA RTX 4080
+SUPER confirmed presentation during startup. Stable world rendering and
+30 fps in the world remain unverified on this setup.
+
+| Area | Verified on 2026-11-25 |
+|------|------------------------|
+| Boot and presentation | Two diagnostic runs recorded 1,352 and 1,206 successful Presents before their memory guard stopped them. |
+| World entry | Both runs stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
+| Memory | In one 250 ms sample, descriptor creation requested 1.63 MiB of data and allocated 640 MiB of shared buffer windows. The 256 KiB grid reduced average allocation size but produced more windows and still reached the memory limit. The default grid is 4 MiB. |
+
+The test binary combined fork revision `d6628f8` with local shader fixes
+and experimental file-backed memory staging. The allocation figures are
+rounded buffer sizes. The historical reports below identify the source
+and hardware for each test. [Memory profiling PR #4](https://github.com/Kamiloj9/victory-fork/pull/4),
+[256 KiB follow-up](https://github.com/Kamiloj9/victory-fork/pull/4#pullrequestreview-6059501051)
+
+### Recent changes
+
+- Synced the fxceless history through `0b0074e`, including descriptor mirroring,
+  shader updates, and optional submission and copy paths. [PR #1](https://github.com/Kamiloj9/victory-fork/pull/1)
+- Ported KLBF Lab's empty pipeline-library fix and adapted its placed-texture
+  refresh to recover missed remaps independently for each descriptor heap.
+  The changes passed Windows tests. [PR #2](https://github.com/Kamiloj9/victory-fork/pull/2), [PR #3](https://github.com/Kamiloj9/victory-fork/pull/3)
+- Added opt-in memory sampling and attributed new shared buffer windows to
+  their initiating call. [PR #4](https://github.com/Kamiloj9/victory-fork/pull/4)
 
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  GPL-3.0-or-later, as is this fork.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** is
+  the main source of the rendering and performance work described below.
+- **[KLBF Lab](https://github.com/PastiiJay/klbf-lab)** contributed the
+  pipeline-library and placed-texture fixes. The linked PRs credit the
+  individual contributors.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
@@ -26,9 +57,15 @@ developer or publisher.
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The fxceless fork credits [Claude Code](https://claude.com/claude-code)
+  for its original development work.
 
-## Status of this fork (2026-11-25)
+## Historical test reports
+
+<details>
+<summary>fxceless report on RTX 4070, 2026-11-25</summary>
+
+### Status reported by fxceless
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
@@ -235,16 +272,6 @@ Tools and diagnostics:
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
-- `VICTORY_MEMORY_TIMELINE=1` in a diagnostics build logs process private
-  commit and GPU resource counters every 250 ms, independently of frames.
-  With the memory map enabled, it requests extra walks at 4 and 2 GiB of
-  remaining commit. The resource bytes are logical sizes, and the active
-  pipeline library counts are loads, creates, stores and serializations.
-  The `loose_windows` field counts new shared buffer windows by first caller,
-  separating sized requests, unsized requests, and reuse. Its backing bytes
-  are the rounded buffer sizes, and its requested bytes cover sized requests
-  that created a window. Descriptor creation and later refresh are counted
-  separately.
 
 ### What this fork changed (summary)
 
@@ -281,12 +308,12 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+</details>
 
----
+<details>
+<summary>Marvisak/VIctory report on RX 6700 XT, 2026-11-23</summary>
 
-# VIctory
+### Base project
 
 Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
@@ -296,7 +323,7 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+### Status reported by Marvisak/VIctory
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
@@ -331,6 +358,8 @@ What each part does today and what it still needs:
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+</details>
 
 ## Getting started
 
@@ -396,6 +425,15 @@ A release build has no debugging aids. Build them in with
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
+
+`VICTORY_MEMORY_TIMELINE=1` logs process private commit and GPU resource
+counters every 250 ms, independently of Presents. With the memory map
+enabled, it requests extra walks at 4 and 2 GiB of remaining commit.
+The `loose_windows` field counts new shared buffer windows by the first
+caller. It distinguishes sized requests, unsized requests, and reuse.
+Backing bytes measure the allocated buffer sizes. Requested bytes cover
+sized requests that created a window. Descriptor creation and later
+refresh are counted separately.
 
 | Variable | Effect |
 |----------|--------|
