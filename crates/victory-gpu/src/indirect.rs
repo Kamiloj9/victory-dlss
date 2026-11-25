@@ -346,6 +346,128 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
+/// A GPU snapshot of one dispatch record before and after the existing
+/// clamp, plus the optional execution count. Only maps after the list runs.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct DispatchReadback {
+    buffer: ID3D12Resource,
+    counted: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, PartialEq, Eq)]
+struct DispatchWords {
+    original: [u32; 3],
+    bounded: [u32; 3],
+    count: Option<u32>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl DispatchReadback {
+    fn record(
+        list: &HostList,
+        source: (&ID3D12Resource, u64),
+        bounded: (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+    ) -> Option<Self> {
+        const WORDS: u64 = 12;
+        let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let fits = |(buffer, offset): (&ID3D12Resource, u64), bytes| {
+            // SAFETY: a live resource.
+            let desc = unsafe { buffer.GetDesc() };
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                && offset.checked_add(bytes).is_some_and(|end| end <= desc.Width)
+        };
+        if list.indirect_state(bounded.0) != args || !fits(bounded, WORDS)
+            || !fits(source, WORDS) || count.is_some_and(|range| !fits(range, 4))
+        {
+            return None;
+        }
+        let buffer = host()?.read_back_buffer(2 * WORDS + 4)?;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: the open list just clamped `source` and `count` via read
+        // promotion (or GENERIC_READ, which includes COPY_SOURCE). Only the
+        // clamp scratch has an explicit state, restored before execution.
+        unsafe {
+            list.list.CopyBufferRegion(&buffer, 0, source.0, source.1, WORDS);
+            if let Some((count, offset)) = count {
+                list.list.CopyBufferRegion(&buffer, 2 * WORDS, count, offset, 4);
+            }
+            list.list.ResourceBarrier(&[transition(bounded.0, args, copy)]);
+            list.list.CopyBufferRegion(&buffer, WORDS, bounded.0, bounded.1, WORDS);
+            list.list.ResourceBarrier(&[transition(bounded.0, copy, args)]);
+        }
+        Some(Self { buffer, counted: count.is_some() })
+    }
+
+    fn read(&self) -> Option<DispatchWords> {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the list finished and owns this readback's 28 bytes.
+        unsafe {
+            self.buffer.Map(0, None, Some(&mut data)).ok()?;
+            if data.is_null() {
+                self.buffer.Unmap(0, None);
+                return None;
+            }
+            let words = data.cast::<u32>();
+            let original = words.cast::<[u32; 3]>().read_unaligned();
+            let bounded = words.add(3).cast::<[u32; 3]>().read_unaligned();
+            let count = self.counted.then(|| words.add(6).read_unaligned());
+            self.buffer.Unmap(0, None);
+            Some(DispatchWords { original, bounded, count })
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct DispatchProbe {
+    readback: DispatchReadback,
+    shader: String,
+    number: u8,
+    recording_frame: u64,
+    address: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl DispatchProbe {
+    pub(crate) fn record(
+        list: &HostList,
+        shader: &str,
+        address: u64,
+        source: (&ID3D12Resource, u64),
+        bounded: (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+    ) {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static TARGET: OnceLock<Option<String>> = OnceLock::new();
+        static CLAIMED: AtomicU8 = AtomicU8::new(0);
+        let target = TARGET.get_or_init(|| std::env::var("VICTORY_TRACE_DISPATCH_ARGS").ok());
+        if target.as_deref() != Some(shader) {
+            return;
+        }
+        let Ok(index) = CLAIMED.fetch_update(Relaxed, Relaxed, |n| (n < 4).then_some(n + 1)) else { return };
+        let Some(readback) = DispatchReadback::record(list, source, bounded, count) else {
+            tracing::warn!(shader, address, "could not record indirect dispatch argument probe");
+            return;
+        };
+        list.defer_dispatch_probe(Self {
+            readback, shader: shader.to_owned(), number: index + 1,
+            recording_frame: crate::frame::current(), address,
+        });
+    }
+
+    pub(crate) fn report(&self) {
+        let Self { shader, number, recording_frame, address, .. } = self;
+        let Some(DispatchWords { original, bounded, count }) = self.readback.read() else {
+            tracing::warn!(shader, number, recording_frame, address, "could not map indirect dispatch argument probe");
+            return;
+        };
+        tracing::info!(shader, number, recording_frame, completed_frame = crate::frame::current(),
+            address, ?original, ?bounded, ?count, "indirect dispatch GPU arguments");
+    }
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -730,6 +852,37 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires D3D12 debug layer and WARP"]
+    fn dispatch_probe_reads_clamped_and_original_arguments_in_order() {
+        let host = super::host().expect("a D3D12 host");
+        let warp = crate::host::warp_adapter().expect("the WARP adapter");
+        // SAFETY: plain queries of a live adapter and device.
+        let (expected, actual) = unsafe {
+            (warp.GetDesc().expect("WARP description").AdapterLuid, host.device.GetAdapterLuid())
+        };
+        assert_eq!((actual.HighPart, actual.LowPart), (expected.HighPart, expected.LowPart),
+            "test must run on WARP");
+        let list = host.new_list().expect("a host list");
+        let (source, source_ptr) = host.shared_buffer(64).expect("source buffer");
+        let (count, count_ptr) = host.shared_buffer(4).expect("count buffer");
+        let original = [65535u32, 32, 1];
+        // SAFETY: both mapped buffers hold these writes and are idle.
+        unsafe {
+            source_ptr.cast::<[u32; 3]>().write(original);
+            count_ptr.cast::<u32>().write(1);
+        }
+        let bounded = bound(&list, (&source, 0), Some((&count, 0)), (2, 12, 1)).expect("clamp");
+        let capture = DispatchReadback::record(&list, (&source, 0), (&bounded, 0), Some((&count, 0)))
+            .expect("GPU argument probe");
+        list.close();
+        assert_eq!(host.log_messages(), None, "no debug layer errors while recording");
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "no debug layer errors after execution");
+        assert_eq!(capture.read(), Some(DispatchWords { original, bounded: [0; 3], count: Some(1) }));
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
