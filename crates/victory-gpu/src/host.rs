@@ -8595,9 +8595,20 @@ void main() {
 
     #[test]
     fn warp_title_bytes_go_up_and_shader_writes_come_back_whatever_the_queues() {
+        check_title_gpu_roundtrip(false);
+    }
+
+    #[test]
+    #[ignore = "requires WARP, a window VRAM budget and file staging"]
+    fn warp_file_backed_loose_window_roundtrips_gpu_writes() {
+        check_title_gpu_roundtrip(true);
+    }
+
+    fn check_title_gpu_roundtrip(loose_window: bool) {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
         let Some(host) = host() else {
+            assert!(!loose_window, "the loose-window test needs a D3D12 host");
             return;
         };
         // Never on a real card.
@@ -8608,6 +8619,7 @@ void main() {
             .and_then(|a| unsafe { a.GetDesc1() }.ok())
             .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
         if !software {
+            assert!(!loose_window, "the loose-window test needs WARP");
             eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
             return;
         }
@@ -8616,15 +8628,33 @@ void main() {
         const ROUNDS: usize = 12;
         // "Title memory": write-watched, as the title's is.
         // SAFETY: a plain allocation of our own.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
-        assert!(!title.is_null());
+        let bytes = if loose_window { 2 * LEN } else { LEN };
+        let allocation = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!allocation.is_null());
+        // SAFETY: the aligned window and all of its bytes are inside the
+        // double-sized allocation.
+        let title = if loose_window {
+            unsafe { allocation.add(allocation.align_offset(LEN)) }
+        } else {
+            allocation
+        };
         let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
         for i in 0..LEN / 4 {
             // SAFETY: inside the allocation.
             unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
         }
-        crate::shadow::register(0x51_5151, title as u64, LEN as u64);
+        if loose_window {
+            #[cfg(feature = "diagnostics")]
+            assert_eq!(crate::shadow::extent(title as u64), None);
+        } else {
+            crate::shadow::register(0x51_5151, title as u64, LEN as u64);
+        }
         let shadow = crate::shadow::find(title as u64, LEN as u64, crate::shadow::WindowCaller::Diagnostic).expect("a host copy");
+        if loose_window {
+            assert!(matches!(shadow.card_sides(), Some((None, _, _))), "expected a file-backed card window");
+            let again = crate::shadow::find(title as u64 + 64, 4, crate::shadow::WindowCaller::TableBuffer).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&shadow, &again), "both bindings must keep the same backing");
+        }
         if !shadow.carded() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;

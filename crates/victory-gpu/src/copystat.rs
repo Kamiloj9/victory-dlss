@@ -540,6 +540,7 @@ pub(crate) fn start_memory_timeline() {
                         logical_host_texture_bytes = crate::resource::HOST_TEXTURES[1].load(Relaxed),
                         requested_upload_bytes = crate::host::MADE[1].load(Relaxed),
                         requested_shared_bytes = crate::host::MADE[3].load(Relaxed),
+                        file_window_staging_bytes = crate::shadow::WINDOW_FILE_STAGING.load(Relaxed),
                         loose_windows = ?crate::shadow::window_activity(),
                         pipelines_made,
                         pipelines_loaded,

@@ -327,9 +327,9 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// A window goes to the card while there is room under this number and
 /// while a fifth of the card's budget is free, as title buffers do
 /// (`card_for`): textures keep their room, and once they have filled the
-/// card later windows stay where they are. The CPU's side stays in the PC's
-/// memory, so the memory shared with the card does not shrink by this
-/// alone; what moves is what shaders read.
+/// card later windows stay where they are. The CPU side is shared memory
+/// by default. With file staging enabled an admitted window can use a
+/// mapped file and the bounded card uploader instead.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
@@ -339,6 +339,9 @@ fn window_card_most() -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Logical bytes of live file staging for loose windows on the card.
+pub(crate) static WINDOW_FILE_STAGING: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
@@ -1961,6 +1964,9 @@ impl Drop for Shadow {
         let window = self.window;
         if let Some(card) = &mut self.card {
             if window {
+                if matches!(card.staging, CardStaging::File(_)) {
+                    WINDOW_FILE_STAGING.fetch_sub(card.size, Ordering::Relaxed);
+                }
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
@@ -3891,18 +3897,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, caller: WindowCal
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card::new(CardStaging::Shared(buffer), len);
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
-    };
+    let (buffer, data, card) = window_backing(start, len)?;
+    let shared = card.as_ref().is_none_or(|card| matches!(card.staging, CardStaging::Shared(_)));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
@@ -3919,8 +3915,46 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, caller: WindowCal
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
-    caller.record(requested, Some(len));
+    if shared {
+        caller.record(requested, Some(len));
+    }
     Some(shadow)
+}
+
+/// File staging is used only for windows admitted to card memory.
+fn window_backing(start: u64, len: u64) -> Option<(ID3D12Resource, *mut u8, Option<Card>)> {
+    let directory = crate::card_staging::directory();
+    let mut admitted = directory.map(|_| window_card_for(len));
+    if let Some(directory) = directory && admitted.as_ref().is_some_and(Option::is_some) {
+        match crate::card_staging::Backing::new(directory, len as usize) {
+            Ok(backing) => {
+                let buffer = admitted.take()??;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let data = backing.data();
+                if WINDOW_FILE_STAGING.fetch_add(len, Ordering::Relaxed) == 0 {
+                    tracing::info!("loose card windows use file-backed CPU staging");
+                }
+                return Some((buffer, data, Some(Card::new(CardStaging::File(backing), len))));
+            }
+            Err(error) => tracing::warn!(%error, len, "could not map card window staging file; using a shared buffer"),
+        }
+    }
+    let Some((shared, data)) = host().and_then(|host| host.shared_buffer(len)) else {
+        if admitted.is_some_and(|buffer| buffer.is_some()) {
+            WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        return None;
+    };
+    crate::host::name(&shared, || format!("title memory {start:#x}+{len:#x}"));
+    let on_card = admitted.unwrap_or_else(|| window_card_for(len));
+    let (buffer, card) = match on_card {
+        Some(buffer) => {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} on the card"));
+            (buffer, Some(Card::new(CardStaging::Shared(shared), len)))
+        }
+        None => (shared, None),
+    };
+    Some((buffer, data, card))
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,

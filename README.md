@@ -17,11 +17,11 @@ SUPER confirmed presentation during startup. Stable world rendering and
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
-| Boot and presentation | Two diagnostic runs recorded 1,352 and 1,206 successful Presents before their memory guard stopped them. |
-| World entry | Both runs stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
-| Memory | In one 250 ms sample, descriptor creation requested 1.63 MiB of data and allocated 640 MiB of shared buffer windows. The 256 KiB grid reduced average allocation size but produced more windows and still reached the memory limit. The default grid is 4 MiB. |
+| Boot and presentation | Three diagnostic runs recorded 1,352, 1,206, and 1,127 successful Presents before their memory guard stopped them. |
+| World entry | All three runs stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
+| Memory | In one 250 ms sample, descriptor creation requested 1.63 MiB of data and allocated 640 MiB of shared buffer windows. The 256 KiB grid reduced average allocation size but produced more windows and still reached the memory limit. The default grid is 4 MiB. A separate file-staging run reached 224 MiB of live window staging capacity with zero new shared window allocations before its last sample. |
 
-The test binary combined fork revision `d6628f8` with local shader fixes
+The test binaries combined fork revision `d6628f8` with local shader fixes
 and experimental file-backed memory staging. The allocation figures are
 rounded buffer sizes. The historical reports below identify the source
 and hardware for each test. [Memory profiling PR #4](https://github.com/Kamiloj9/victory-fork/pull/4),
@@ -375,7 +375,9 @@ the Windows paging file size, then retry.
 On native Windows, `VICTORY_CARD_STAGING_DIR` enables experimental file-backed
 CPU staging for registered buffers admitted to VRAM. Set it to an existing,
 writable directory outside the checkout on a local volume supporting sparse
-files. Set `VICTORY_RELAY=0`, `VICTORY_LATE_WAIT=0`, and `VICTORY_QUEUE2=0`;
+files. To include loose windows admitted to VRAM, also set
+`VICTORY_CARD_WINDOWS_MB` to a nonzero budget; its default is zero. Windows
+that do not fit the GPU budget keep their ordinary shared staging. Set `VICTORY_RELAY=0`, `VICTORY_LATE_WAIT=0`, and `VICTORY_QUEUE2=0`;
 otherwise this path stays off. File setup failures fall back to shared staging.
 The per-file free-space check does not reserve disk space: later writes can
 exhaust the volume or encounter I/O errors. Uploads wait for the GPU in 16 MiB
@@ -439,11 +441,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 `VICTORY_MEMORY_TIMELINE=1` logs process private commit and GPU resource
 counters every 250 ms, independently of Presents. With the memory map
 enabled, it requests extra walks at 4 and 2 GiB of remaining commit.
-The `loose_windows` field counts new shared buffer windows by the first
-caller. It distinguishes sized requests, unsized requests, and reuse.
-Backing bytes measure the allocated buffer sizes. Requested bytes cover
-sized requests that created a window. Descriptor creation and later
-refresh are counted separately.
+The `loose_windows` field attributes new shared buffer windows to the first
+caller. It distinguishes sized and unsized allocations and counts hits on
+any existing loose window. Backing bytes measure the allocated buffer sizes.
+Requested bytes cover sized requests that created a shared window. Descriptor
+creation and later refresh are counted separately. `file_window_staging_bytes`
+reports the logical size of live sparse staging for windows on the card.
 
 | Variable | Effect |
 |----------|--------|
