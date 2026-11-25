@@ -37,6 +37,12 @@ other forks.
 
 ### Recent changes
 
+- Synced both fxceless main branches through `d510ee4`. The FPS counter,
+  indirect-record gathering, and changed-byte refresh are opt-in.
+- Added offline ACCC/FSPX parsing to `shader` and `translate`, adapted
+  from [victory-perf](https://github.com/vitutu1/victory-perf/commit/caa4e445710a0325207886f2a1dcd4e1e9b2cec9).
+  One local FidelityFX library yielded 27 native compute programs from
+  29 containers. The resource analyzer still rejects their descriptor rewrites.
 - Compose the two fullscreen SDR planes submitted by Series S so the UI
   reaches the window. Based on [victory-perf](https://github.com/vitutu1/victory-perf/commit/c3faf2a86a28ca4258eed8402a193e14ab5ec41d)
   and the layout reported in [VIctory #1997](https://github.com/Marvisak/VIctory/pull/1997).
