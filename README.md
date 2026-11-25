@@ -504,6 +504,14 @@ exhaust the volume or encounter I/O errors. Uploads wait for the GPU in 16 MiB
 batches and disk access may add latency. Temporary files are removed when their
 mappings are released.
 
+`VICTORY_PHYSICAL_BACKING_DIR` separately enables sparse files for the title's
+physical page sections on native Windows. Use an existing writable directory
+outside the checkout. The volume must report enough free space for the full
+requested size of each section. This check does not reserve space for later
+writes. If setup fails, VIctory reports the allocation failure to the title.
+Windows otherwise uses pagefile-backed sections for these pages, and Wine
+keeps its existing backing mode.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
