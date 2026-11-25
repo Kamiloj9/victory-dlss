@@ -23,6 +23,7 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::shadow::WindowCaller;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -473,7 +474,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = crate::shadow::find(address, 1, WindowCaller::RootView)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -776,6 +777,7 @@ impl State {
         slot: u8,
         dword: u32,
         memory: Option<&crate::memory::Ready>,
+        caller: WindowCaller,
     ) -> u32 {
         use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
@@ -786,7 +788,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
+                Some(&Root::View(address)) => crate::shadow::find(address, 1, caller).map_or(0, |s| {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                     ((s.gpu(address) - base) & 15) as u32
@@ -881,7 +883,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size), WindowCaller::Geometry) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -899,7 +901,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size), WindowCaller::Geometry) else {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1027,7 +1029,7 @@ impl State {
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref(), WindowCaller::RootView);
                         continue;
                     }
                     let fresh = made
@@ -1113,6 +1115,7 @@ impl State {
                             slot,
                             0,
                             None,
+                            WindowCaller::RootView,
                         ));
                     }
                     // SAFETY: an open list; the address is in live memory.
@@ -1188,7 +1191,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = crate::shadow::find(a, 1, WindowCaller::RootView)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1307,7 +1310,7 @@ impl State {
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| crate::shadow::find(a, 1, WindowCaller::RootView).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
@@ -1451,7 +1454,7 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view, WindowCaller::BindlessBuffer) else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1934,7 +1937,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, WindowCaller::BindlessBuffer);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2138,7 +2141,7 @@ impl State {
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
                 let v = match u.root {
-                    RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
+                    RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None, WindowCaller::Diagnostic),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
                 };
                 let _ = write!(text, " u{}={v:#x}", u.index);
@@ -2149,7 +2152,7 @@ impl State {
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
+                    let host = crate::shadow::find(*address, 1, WindowCaller::Diagnostic)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
@@ -2461,7 +2464,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, WindowCaller::TableBuffer);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2586,7 +2589,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, WindowCaller::TableBuffer);
                     }
                 }
                 for k in selected {
@@ -2597,7 +2600,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, WindowCaller::TableBuffer);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2635,7 +2638,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, WindowCaller::TableBuffer);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2798,7 +2801,7 @@ impl State {
             if v.address == 0
                 || stride == 0
                 || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
+                || crate::shadow::find(from, rects * 3 * stride, WindowCaller::Validation).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
@@ -2945,12 +2948,12 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
+        let Some(args) = crate::shadow::find_any(arguments, len, WindowCaller::Indirect) else {
             why("arguments outside title buffers");
             return false;
         };
         let counter = match count {
-            Some(at) => match crate::shadow::find_any(at, 4) {
+            Some(at) => match crate::shadow::find_any(at, 4, WindowCaller::Indirect) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
@@ -3187,13 +3190,13 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View, caller: WindowCaller) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view, caller) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

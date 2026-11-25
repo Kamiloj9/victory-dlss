@@ -240,6 +240,11 @@ Tools and diagnostics:
   With the memory map enabled, it requests extra walks at 4 and 2 GiB of
   remaining commit. The resource bytes are logical sizes, and the active
   pipeline library counts are loads, creates, stores and serializations.
+  The `loose_windows` field counts new shared buffer windows by first caller,
+  separating sized requests, unsized requests, and reuse. Its backing bytes
+  are the rounded buffer sizes, and its requested bytes cover sized requests
+  that created a window. Descriptor creation and later refresh are counted
+  separately.
 
 ### What this fork changed (summary)
 

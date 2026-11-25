@@ -509,11 +509,16 @@ fn schedule_memory_map() -> bool {
     true
 }
 
+pub(crate) fn memory_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMELINE").is_some_and(|v| v == "1"))
+}
+
 /// Sample across long frames without relying on the thread that presents.
 pub(crate) fn start_memory_timeline() {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
-        if std::env::var_os("VICTORY_MEMORY_TIMELINE").is_none_or(|v| v != "1") {
+        if !memory_timeline_enabled() {
             return;
         }
         let task = std::thread::Builder::new().name("victory-memory-timeline".into()).spawn(|| {
@@ -535,6 +540,7 @@ pub(crate) fn start_memory_timeline() {
                         logical_host_texture_bytes = crate::resource::HOST_TEXTURES[1].load(Relaxed),
                         requested_upload_bytes = crate::host::MADE[1].load(Relaxed),
                         requested_shared_bytes = crate::host::MADE[3].load(Relaxed),
+                        loose_windows = ?crate::shadow::window_activity(),
                         pipelines_made,
                         pipelines_loaded,
                         active_library_calls = ?crate::pipeline::active_library_calls(),
