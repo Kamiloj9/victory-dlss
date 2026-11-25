@@ -17,16 +17,16 @@ SUPER confirmed presentation during startup. Stable world rendering and
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
-| Boot and presentation | The latest guarded run recorded 1,206 successful Presents before the memory guard stopped it after 43.1 seconds. |
+| Boot and presentation | The latest guarded run on local diagnostics revision `c827e4f` recorded 1,613 successful Presents before the memory guard stopped it after 53.3 seconds. |
 | World entry | The run stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
-| Memory | In the guarded run, title-filled textures and mapped texture tiles stayed near the 1,536 MiB budget. One 250 ms sample added 760 MiB of live logical texture allocations, mostly render targets and depth resources. Two later samples added 2.74 GiB of process private commit with almost flat live texture bytes. |
+| Memory | In the baseline (`bc5eef5`), one 250 ms sample added 760 MiB of live logical textures, mostly render targets and depth resources. Two later samples added 2.74 GiB of private commit with almost flat live texture bytes. The latest run sampled 48 MiB of reserved buffer address space, 20.25 MiB of mapped buffer tiles, and 32 MiB of tile heaps. The runs stopped at different points in loading, so these results cannot quantify the change in peak memory for the same workload. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
 
-The guarded run used the local diagnostics revision `bc5eef5`, which combined
-fork history with local shader fixes, file-backed memory staging, and texture
-counters. It used a 4 MiB window grid and a 2 GiB admission limit for
-file-staged windows. The historical reports below identify the source and
-hardware for results reported by other forks.
+The baseline recorded 1,206 successful Presents in 43.1 seconds. Both
+local diagnostics runs used a 4 MiB window grid, a 2 GiB file-staged window
+admission limit, and a 1,536 MiB indexed texture budget. The latest run
+enabled experimental reserved buffers for some loose windows. Historical
+reports below identify the source and hardware for results from other forks.
 [Window profiling](https://github.com/Kamiloj9/victory-fork/pull/4),
 [File staging](https://github.com/Kamiloj9/victory-fork/pull/6),
 [Texture allocation counters](https://github.com/Kamiloj9/victory-fork/pull/7)
@@ -437,6 +437,39 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+## Shader development workflow
+
+The [Shader toolchain workflow](.github/workflows/shader-toolchain.yml) runs
+on shader and GPU pull requests and can be dispatched manually. It compiles
+a synthetic bindless TextureCube and TextureCubeArray shader with DXC and
+saves its DXIL disassembly. It also checks VIctory's emitted shaders with the
+DXIL validator and exercises descriptors and a buffer writeback on WARP
+with the D3D12 debug layer and GPU-based validation.
+
+Run the same checks from PowerShell 7 on Windows with the Windows SDK and
+the Graphics Tools optional feature installed.
+
+```powershell
+pwsh -File tools/shader-workflow.ps1
+```
+
+Set `VICTORY_PC_DXC` and `VICTORY_DXIL` to select a compiler and validator.
+With an authorized Xbox compiler, set `VICTORY_CONSOLE_DXC` to also enable
+the console-to-PC shader comparisons in the test suite. You can point
+`-CorpusPath` at a local shader corpus for offline translation, validation,
+and pipeline creation. All reports are written to the printed directory.
+
+On a compatible native GPU, install PIX and pass an existing capture to
+export its GPU events and timing counters to CSV. Compare the events and
+bound resources in PIX against the DXC listing and the bindings seen in
+REA traces. Keep logs, captures, and corpus outputs from game files local.
+[PIX command-line tool](https://devblogs.microsoft.com/pix/pixtool/),
+[GPU-based validation](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-d3d12-debug-layer-gpu-based-validation)
+
+```powershell
+pwsh -File tools/shader-workflow.ps1 -PixOnly -PixCapture "D:/captures/scene.pix3"
+```
 
 ## Debugging
 

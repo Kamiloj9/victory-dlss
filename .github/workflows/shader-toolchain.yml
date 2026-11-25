@@ -1,0 +1,45 @@
+name: Shader toolchain
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/shader-toolchain.yml'
+      - 'tools/shader-workflow.ps1'
+      - 'apps/victory/**'
+      - 'crates/victory-shader/**'
+      - 'crates/victory-gpu/**'
+      - 'crates/victory-pipeline/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shader-toolchain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shaders:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Enable the D3D12 debug layer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path (Join-Path $env:SystemRoot 'System32/D3D12SDKLayers.dll'))) {
+            Add-WindowsCapability -Online -Name 'Tools.Graphics.DirectX~~~~0.0.1.0'
+          }
+      - name: Check DXC, emitted DXIL, and D3D12 bindings
+        shell: pwsh
+        run: ./tools/shader-workflow.ps1 -ReportDirectory (Join-Path $env:RUNNER_TEMP 'victory-shader-report')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shader-toolchain-report
+          path: ${{ runner.temp }}/victory-shader-report
+          retention-days: 7
