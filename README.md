@@ -17,16 +17,19 @@ SUPER confirmed presentation during startup. Stable world rendering and
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
-| Boot and presentation | The latest guarded run recorded 1,206 successful Presents before the memory guard stopped it. |
-| World entry | The latest tests stopped before the first world frame marker. Gameplay and world frame rate still need verification. |
-| Memory | In the latest run, the 1536 MiB indexed texture budget held the sampled total of title-filled textures and mapped tiles near that limit. One 250 ms sample added 760 MiB of live logical texture allocations, mostly render targets and depth resources. Two later samples added 2.74 GiB of process private commit with almost flat live texture bytes. |
+| Boot and presentation | The latest guarded run recorded 1,206 successful Presents before the memory guard stopped it after 43.1 seconds. |
+| World entry | The run stopped before the first world frame marker. Gameplay, character rendering, and world frame rate still need verification on this setup. |
+| Memory | In the guarded run, title-filled textures and mapped texture tiles stayed near the 1,536 MiB budget. One 250 ms sample added 760 MiB of live logical texture allocations, mostly render targets and depth resources. Two later samples added 2.74 GiB of process private commit with almost flat live texture bytes. |
+| Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
 
-The test binaries combined fork revision `d6628f8` with local shader fixes
-and experimental file-backed memory staging. The latest run used the 4 MiB
-window grid and the 2 GiB window admission limit for file staging. The
-historical reports below identify the source and hardware for each test.
+The guarded run used the local diagnostics revision `bc5eef5`, which combined
+fork history with local shader fixes, file-backed memory staging, and texture
+counters. It used a 4 MiB window grid and a 2 GiB admission limit for
+file-staged windows. The historical reports below identify the source and
+hardware for results reported by other forks.
 [Window profiling](https://github.com/Kamiloj9/victory-fork/pull/4),
-[File staging](https://github.com/Kamiloj9/victory-fork/pull/6)
+[File staging](https://github.com/Kamiloj9/victory-fork/pull/6),
+[Texture allocation counters](https://github.com/Kamiloj9/victory-fork/pull/7)
 
 ### Recent changes
 
@@ -39,6 +42,8 @@ historical reports below identify the source and hardware for each test.
   their initiating call. [PR #4](https://github.com/Kamiloj9/victory-fork/pull/4)
 - Added optional file-backed staging for buffers and loose windows admitted
   to VRAM. [PR #6](https://github.com/Kamiloj9/victory-fork/pull/6)
+- Added D3D12 texture allocation counters by resource family for the memory
+  timeline. [PR #7](https://github.com/Kamiloj9/victory-fork/pull/7)
 
 ## Credits
 
