@@ -10,7 +10,8 @@ in either median or p95 frame time on the matched workload. Include
 before/after images or a readable comparison report. Synthetic scenes are
 welcome. Keep game assets, saves, shaders and proprietary captures out of Git.
 Update the evidence when the tested commit changes. Documentation-only PRs
-can omit this section. -->
+can omit this section. Changes confined to this template, its validator, or the
+shader test workflow and script also omit gameplay evidence and run the GPU suite. -->
 
 Baseline commit: <!-- current base SHA -->
 Candidate commit: <!-- PR head SHA -->
