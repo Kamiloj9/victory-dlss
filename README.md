@@ -11,16 +11,19 @@ developer or publisher.
 
 ## Current status
 
-**Experimental.** Guarded Windows tests on an NVIDIA RTX 4080 SUPER showed
-the Series S account selector and reached the first 3D draw marker in
-Series X. Visible, sustained gameplay and 30 fps remain unverified on this
-setup.
+**Experimental.** On an NVIDIA RTX 4080 SUPER, guarded Windows tests on
+2026-11-25 reached the prologue on Series X and the first 3D draw marker on
+Series S. The Series X capture showed subtitles over a very dark frame.
+The sampled Series S scene color was black. Sustained gameplay and 30 fps
+remain unverified on this setup.
 
 | Area | Verified on 2026-11-25 |
 |------|------------------------|
 | Boot and presentation | Two guarded runs on local diagnostics revision `f9fbd8d` recorded 1,215 and 1,166 successful Presents. The memory guard stopped them after 47.3 and 44.0 seconds. |
 | Series S presentation | A guarded capture showed the account selector in the final window buffer after composing the 3840×2160 UI plane over the 1920×1080 game plane. Two captured world frames had zero RGB and alpha in both source planes before composition. |
 | World entry | A guarded Series S run created host pipelines for two previously rejected geometry compute shaders. The scene depth readback shows people and world geometry. Both the scene color and the upscaler output had zero RGB at the sampled Present. A FidelityFX compute shader used during world entry contains an ACCC part and no DXIL. Visible gameplay and world frame rate still need verification. |
+| Series S color diagnosis | A local diagnostic build based on `6d6d56d5` reached the 500-draw marker at frame 1434 after 51.3 s. The sampled color was zero at the upscaler input. For one mesh draw, an occlusion query counted one passing sample, while the bound color multiplier and the color target remained zero. The runner ended the test after 106.0 s when the observation window completed. [Base revision, PR #23](https://github.com/Kamiloj9/victory-dlss/pull/23) |
+| Series X prologue capture | A local diagnostic build based on `6d6d56d5` reached the 500-draw marker at frame 1234 after 51.2 s. The capture showed prologue subtitles with very dark scene color. Logged post-entry intervals ranged from about 0.2 to 1.5 fps with diagnostics enabled. The runner ended the test after 106.3 s when the observation window completed. [Base revision, PR #23](https://github.com/Kamiloj9/victory-dlss/pull/23) |
 | Series X world-entry marker | With file-backed guest pages and reserved buffer windows enabled in `e08a664`, the trace reached its first 500-draw marker at frame 1444. Presents for frames 1444 and 1445 followed. The Windows commit guard stopped the run before a world image was captured. [PR #21](https://github.com/Kamiloj9/victory-dlss/pull/21) |
 | KLBF Series S reference | A local test build based on KLBF `3c2dbec` added file-backed guest pages and reached the 500-draw marker. On the RTX, PC FSR 3.1.6 returned success while recording a 720p-to-1080p upscale dispatch. The frames captured around the marker were black. [KLBF main](https://github.com/PastiiJay/klbf-lab/tree/main) |
 | Target allocations | The 2 GiB and 3 GiB window runs traced 127 and 132 render-target and depth allocations. Their estimated guest virtual ranges showed no overlap among live wrappers. The trace did not record physical aliases. |
