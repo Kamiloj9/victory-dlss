@@ -2,15 +2,9 @@ name: Shader toolchain
 
 on:
   pull_request:
-    paths:
-      - '.github/workflows/shader-toolchain.yml'
-      - 'tools/shader-workflow.ps1'
-      - 'apps/victory/**'
-      - 'crates/victory-shader/**'
-      - 'crates/victory-gpu/**'
-      - 'crates/victory-pipeline/**'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -22,23 +16,34 @@ concurrency:
 
 jobs:
   shaders:
+    name: 3D rendering regression gate
     runs-on: windows-2025
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
-      - run: rustup toolchain install
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check PR comparison evidence
+        id: scope
+        run: python tools/check-render-pr.py
+      - if: steps.scope.outputs.render == 'true'
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.render == 'true'
       - name: Enable the D3D12 debug layer
+        if: steps.scope.outputs.render == 'true'
         shell: pwsh
         run: |
           if (-not (Test-Path (Join-Path $env:SystemRoot 'System32/D3D12SDKLayers.dll'))) {
             Add-WindowsCapability -Online -Name 'Tools.Graphics.DirectX~~~~0.0.1.0'
           }
       - name: Check DXC, emitted DXIL, and D3D12 bindings
+        if: steps.scope.outputs.render == 'true'
         shell: pwsh
         run: ./tools/shader-workflow.ps1 -ReportDirectory (Join-Path $env:RUNNER_TEMP 'victory-shader-report')
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.scope.outputs.render == 'true'
         with:
           name: shader-toolchain-report
           path: ${{ runner.temp }}/victory-shader-report

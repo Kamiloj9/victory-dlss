@@ -128,6 +128,14 @@ try {
     $gpu = @('test', '--locked', '-p', 'victory-gpu', '--features', 'diagnostics', '--lib')
     Invoke-Tool $cargo ($gpu + @('descriptor::', '--', '--test-threads=1')) 'descriptor-tests.log'
     Invoke-Tool $cargo ($gpu + @('warp_file_backed_loose_window_roundtrips_gpu_writes', '--', '--ignored', '--nocapture')) 'warp-gpu-validation.log'
+    # Rasterize and composite a synthetic scene, then verify the RGBA readback.
+    # Cargo also exits successfully if a filter selects zero tests.
+    $pixelTest = 'present_overlay::tests::warp_premultiplied_overlay_readback'
+    Invoke-Tool $cargo ($gpu + @($pixelTest, '--', '--ignored', '--exact', '--nocapture')) 'warp-pixel-readback.log'
+    $pixelLog = Join-Path $report 'warp-pixel-readback.log'
+    if (-not (Select-String -Quiet -LiteralPath $pixelLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
+        throw "The required pixel readback test did not run: $pixelTest"
+    }
     if ($corpus.Count) {
         $env:VICTORY_WARP = '1'
         Invoke-Tool $cargo (@('run', '--locked', '-p', 'victory', '--', 'translate', '--validate', '--pipelines', '--list', '--') + $corpus) 'local-corpus.log'
