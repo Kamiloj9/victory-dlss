@@ -26,7 +26,8 @@ jobs:
           persist-credentials: false
       - name: Check PR comparison evidence
         id: scope
-        run: python tools/check-render-pr.py
+        shell: pwsh
+        run: ./tools/check-render-pr.ps1
       - if: steps.scope.outputs.render == 'true'
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
