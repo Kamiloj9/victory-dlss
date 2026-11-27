@@ -5607,6 +5607,13 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capped_view_heap_honors_the_configured_pool_up_to_half() {
+        let null = super::PORTABLE_VIEWS - 1;
+        assert_eq!(super::dynamic_slot_count(null, null, None), super::DYNAMIC);
+        assert_eq!(super::dynamic_slot_count(null, null, Some(super::DYNAMIC / 2)), super::DYNAMIC);
+        assert_eq!(super::dynamic_slot_count(null, null, Some(524_288)), null / 2);
+    }
     use super::*;
 
     fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
