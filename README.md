@@ -5,6 +5,32 @@ compatibility layer for running an Xbox Series title on Windows from files
 the user supplies. This repository follows [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
 and integrates reviewed rendering, shader, and memory-management fixes.
 
+## RTX 4080 SUPER performance profile
+
+On Windows with an RTX 4080 SUPER (driver 621.14), the Series S preset
+took 184.8 s for 2,000 world present intervals on `237e2b4fe`, down from
+221.6 s on `230a975fa` (+19.9% throughput). Present interval p95 fell
+from 406.7 to 276.9 ms. These are submitted presents across multiple
+scenes. In a separate Series S comparison of actual displays, the matched
+bar sequence improved from 5.09 to 13.09 FPS (p95 642 to 114 ms).
+The short bunk-bed shot in the NVIDIA preset had a higher p95
+(400 to 493 ms) despite a faster median. The direct-launch profile showed
+a local purple patch near the bunk. The preset uses ambient 0.8.
+
+Build and launch with PowerShell from the repository root:
+
+```powershell
+cargo build --locked --profile diag --features diagnostics -p victory
+./scripts/play-rtx4080-super.ps1 -GameExe 'D:\games\your-dump\game_scarlett_master.exe'
+```
+
+The launcher uses persistent cache, data and sparse backing directories
+under `%LOCALAPPDATA%/VIctory/rtx-4080-super`. Use `-StateDir` for another
+location outside the repository or `-VictoryExe` for an existing build.
+The first run can compile shaders and populate the cache. Benchmark runs
+used a preseeded cache and an external 8 GiB working-set cap. The launcher
+uses normal interactive input and omits benchmark capture and debug logging.
+
 ## Frame generation: what your card supports
 
 | Your card | Frame generation | Limits |
