@@ -17,6 +17,7 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
@@ -60,7 +61,6 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
-    bytes: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -105,13 +105,7 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
-            bytes: data,
         })
-    }
-
-    /// The bytes within the container's declared length.
-    pub fn as_bytes(&self) -> &'a [u8] {
-        self.bytes
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {

@@ -8,23 +8,6 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-#[cfg(test)]
-mod selected_target_tests {
-    use super::selected_targets;
-
-    #[test]
-    fn resolves_only_a_complete_unique_fixed_role_selection() {
-        let selection = "dispatch=1\ncolor=0x1000\ndepth=0x2000\nmotion=0x3000\noutput=0x4000\n";
-        assert_eq!(selected_targets(selection), Some((1, [0x1000, 0x2000, 0x3000, 0x4000])));
-        assert!(selected_targets(selection.trim_end_matches("output=0x4000\n")).is_none());
-        assert!(selected_targets(&selection.replace("0x4000", "0x1000")).is_none());
-        assert!(selected_targets(&selection.replace("0x4000", "0x0")).is_none());
-        assert!(selected_targets(&selection.replace("output", "depth")).is_none());
-        assert!(selected_targets(&format!("{selection}extra=0x5000\n")).is_none());
-        assert!(selected_targets(&selection.replace("dispatch=1", "dispatch=0")).is_none());
-    }
-}
-
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -137,22 +120,6 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
-}
-
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -184,7 +151,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -211,6 +178,27 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    let png = encode(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -218,15 +206,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -374,7 +358,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -405,91 +389,6 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
-    }
-}
-
-const UPSCALER_ROLES: [&str; 4] = ["color", "depth", "motion", "output"];
-
-fn selected_targets(text: &str) -> Option<(u32, [usize; 4])> {
-    let mut lines = text.lines();
-    let dispatch = lines.next()?.strip_prefix("dispatch=")?.parse::<u32>().ok()?;
-    let mut addresses = [0; 4];
-    for line in lines {
-        let (role, address) = line.split_once('=')?;
-        let index = UPSCALER_ROLES.iter().position(|&name| name == role)?;
-        let address = usize::from_str_radix(address.strip_prefix("0x")?, 16).ok()?;
-        if address == 0 || addresses[index] != 0 || addresses.contains(&address) {
-            return None;
-        }
-        addresses[index] = address;
-    }
-    (dispatch != 0 && addresses.iter().all(|&address| address != 0)).then_some((dispatch, addresses))
-}
-
-/// Samples the four Series S upscaler resources identified by a local runtime
-/// probe at one selected Present. This records end-of-frame contents.
-pub(crate) fn dump_upscaler_inputs(frame: u64) {
-    use std::io::Read;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static SELECTOR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static CAPTURED: AtomicBool = AtomicBool::new(false);
-    let Some(path) = SELECTOR.get_or_init(|| {
-        std::env::var_os("VICTORY_CAPTURE_UPSCALER_INPUTS").map(PathBuf::from)
-    }) else {
-        return;
-    };
-    if CAPTURED.load(Ordering::Relaxed) || folder().is_none() {
-        return;
-    }
-    let Ok(file) = std::fs::File::open(path) else { return };
-    let mut selection = String::new();
-    if file.take(513).read_to_string(&mut selection).is_err() || selection.len() > 512 {
-        return;
-    }
-    let Some((dispatch, addresses)) = selected_targets(&selection) else { return };
-    let Some(host) = crate::host::host() else { return };
-    let shapes = [(1280, 720, 10), (1280, 720, 19), (1280, 720, 34), (1920, 1080, 10)];
-    let mut targets = Vec::with_capacity(shapes.len());
-    for ((role, address), shape) in UPSCALER_ROLES.into_iter().zip(addresses).zip(shapes) {
-        let Some(copy) = crate::resource::existing_host_texture(address) else {
-            tracing::warn!(frame, dispatch, role, address, "upscaler target has no live host texture");
-            return;
-        };
-        // SAFETY: `copy` retains this resource.
-        let desc = unsafe { copy.texture.GetDesc() };
-        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1
-            || (desc.Width, desc.Height, desc.Format.0) != shape
-        {
-            tracing::warn!(frame, dispatch, role, address, width = desc.Width, height = desc.Height,
-                format = desc.Format.0, "upscaler target has an unexpected host description");
-            return;
-        }
-        targets.push((role, address, copy, desc));
-    }
-    if CAPTURED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let Ok(list) = host.new_list() else { return };
-    let mut samples = Vec::with_capacity(targets.len());
-    for (role, address, copy, desc) in targets {
-        list.settle(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        let read = read_back(&host.device, &list.list, &copy.texture);
-        let Some((buffer, footprint)) = read else {
-            tracing::warn!(frame, dispatch, role, address, "upscaler target readback unavailable");
-            list.close();
-            return;
-        };
-        samples.push((role, address, desc, buffer, footprint));
-    }
-    list.close();
-    host.execute(&[&list]);
-    for (role, address, desc, buffer, footprint) in samples {
-        let name = format!("frame-{frame}-upscaler-{role}-{address:#x}");
-        tracing::info!(frame, dispatch, role, address, format = desc.Format.0, "upscaler target sampled before Present");
-        save_target(&buffer, &footprint, &desc, address as crate::object::This, &name);
     }
 }
 
@@ -534,17 +433,6 @@ fn dump_one(
         stencil_values(&buffer, &footprint, frame, resource);
     }
     let Some((buffer, footprint)) = read else { return };
-    let name = format!("frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
-    save_target(&buffer, &footprint, d, resource, &name);
-}
-
-fn save_target(
-    buffer: &ID3D12Resource,
-    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    d: &D3D12_RESOURCE_DESC,
-    resource: crate::object::This,
-    name: &str,
-) {
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -575,7 +463,11 @@ fn save_target(
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            save_as(name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            let name = format!(
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                d.Width, d.Height, d.Format.0
+            );
+            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -648,7 +540,6 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
-        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -728,18 +619,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let (finite_low, finite_high) = values.iter().flatten().copied().filter(|v| v.is_finite())
-        .fold((f32::MAX, f32::MIN), |(low, high), v| (low.min(v), high.max(v)));
-    let (low, high) = if grey { (finite_low, finite_high) } else { (0.0, finite_high.max(0.0)) };
+    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
+    let (low, high) = if grey {
+        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
+    } else {
+        (0.0, finite.fold(0.0f32, f32::max))
+    };
     let range = (high - low).max(1e-20);
     // How much of the target holds anything: a lit scene and one bright
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    let nonzero_texels = values.iter().filter(|pixel| pixel.iter().any(|v| v.is_finite() && *v != 0.0)).count();
-    let nonfinite_texels = values.iter().filter(|pixel| pixel.iter().any(|v| !v.is_finite())).count();
-    tracing::info!(format, low, high, finite_low, finite_high, nonzero_percent,
-        nonzero_texels, nonfinite_texels, pixels = values.len(), "target values");
+    tracing::info!(format, low, high, nonzero_percent, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
