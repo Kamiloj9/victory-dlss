@@ -350,7 +350,8 @@ mod tests {
             TEST_VIEW_LIMIT.set(Some(limit));
             super::TEST_SPLIT_LDS.set(Some(false));
             let baseline = crate::emit::translate(&bytes).unwrap();
-            assert_eq!(wave_bounds(&baseline.dxil), [64, 64]);
+            // The NVIDIA renderer also has a general Wave32 fallback without a dispatch contract.
+            assert_eq!(wave_bounds(&baseline.dxil), [32, 32]);
             assert_eq!(baseline.dispatch_contract, crate::emit::DispatchContract::None);
 
             super::TEST_SPLIT_LDS.set(Some(true));
@@ -411,7 +412,7 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let orig = st.exits[0];
             let all = super::all_lane_blocks(&st).unwrap();
-            assert!(lds_meetings(&p, &st, &all).is_none());
+            assert!(lds_meetings(&p, &st, &all, &Default::default()).is_none());
             let proposed = super::lds_snapshot_meetings(&p, &st, &all, 64);
             assert_eq!(proposed.is_some(), accepted);
             if let Some((all, meet)) = proposed {

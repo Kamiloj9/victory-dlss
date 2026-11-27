@@ -37,6 +37,8 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Changes of guarded textures the hash found and the guard did not see.
+    TexHot,
     /// Frames presented since the last line (what the line divides by).
     Frames,
     /// Calls of list methods that record into a host list, and the
@@ -127,18 +129,48 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
-    /// `watch::writes` kernel askings that failed (the range is not
-    /// write-watched: view memory or not watchable).
-    WatchFailed,
-    /// `watch::writes` askings not made because the range's first block is
-    /// already known to be guarded view memory (no kernel call).
-    WatchKnownView,
 }
 const COUNTERS: usize = 80;
-static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+/// One of some sets of counters, each in lines of the processor's memory of
+/// its own: a set for all threads had them wait for each other's lines at
+/// every list call (what counts here is summed up for the log alone).
+#[repr(align(64))]
+struct Bank<const N: usize>([AtomicU64; N]);
+
+/// The sets.
+const BANKS: usize = 32;
+
+static COUNT: [Bank<COUNTERS>; BANKS] = [const { Bank([const { AtomicU64::new(0) }; COUNTERS]) }; BANKS];
+
+/// This thread's set.
+#[inline]
+fn bank() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
+    // (Asked by the allocator too: nothing here allocates.)
+    MINE.try_with(|mine| {
+        if mine.get() == usize::MAX {
+            mine.set(NEXT.fetch_add(1, Relaxed) % BANKS);
+        }
+        mine.get()
+    })
+    .unwrap_or(0)
+}
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+    COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
+}
+
+/// The counter, all sets together, as it is now (it goes back to 0 with
+/// [`log`]).
+pub(crate) fn peek(c: C) -> u64 {
+    let i = c as usize;
+    COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
+}
+
+/// Counter `i`, all sets together, from now on 0.
+fn taken(i: usize) -> u64 {
+    COUNT.iter().map(|b| b.0[i].swap(0, Relaxed)).sum()
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -281,7 +313,13 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// runtime and of the driver alike (3.5 GB in run 60's gameplay, growing by
 /// some 2 MB a frame, and nothing said whose): this says which part is
 /// ours. Bigger blocks are allocations of their own in the map.
-static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static OWN: [Bank<8>; BANKS] = [const { Bank([const { AtomicU64::new(0) }; 8]) }; BANKS];
+
+/// Count `i` of [`OWN`], all sets together (a block made by one thread and
+/// released by another leaves one set below zero: the sum is right).
+fn owned(i: usize) -> u64 {
+    OWN.iter().fold(0u64, |sum, b| sum.wrapping_add(b.0[i].load(Relaxed)))
+}
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
@@ -295,12 +333,13 @@ fn block_class(size: usize) -> usize {
 
 fn own(size: usize, made: bool) {
     let class = block_class(size);
+    let own = &OWN[bank()].0;
     if made {
-        OWN[class].fetch_add(size as u64, Relaxed);
-        OWN[4 + class].fetch_add(1, Relaxed);
+        own[class].fetch_add(size as u64, Relaxed);
+        own[4 + class].fetch_add(1, Relaxed);
     } else {
-        OWN[class].fetch_sub(size as u64, Relaxed);
-        OWN[4 + class].fetch_sub(1, Relaxed);
+        own[class].fetch_sub(size as u64, Relaxed);
+        own[4 + class].fetch_sub(1, Relaxed);
     }
 }
 
@@ -412,7 +451,7 @@ mod command_tests {
 
 #[cfg(test)]
 mod own_tests {
-    use super::{OWN, block_class};
+    use super::{block_class, owned};
     use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
@@ -450,16 +489,16 @@ mod own_tests {
     #[test]
     fn a_block_is_counted_while_it_lives() {
         let block = vec![1u8; 8 << 20];
-        assert!(OWN[3].load(Relaxed) >= 8 << 20);
-        assert!(OWN[7].load(Relaxed) >= 1);
+        assert!(owned(3) >= 8 << 20);
+        assert!(owned(7) >= 1);
         drop(block);
-        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
+        assert!(owned(7) < u64::MAX / 2, "no count below zero");
     }
 }
 
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
-fn process_memory() -> (u64, u64) {
+pub(crate) fn process_memory() -> (u64, u64) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -475,14 +514,14 @@ fn process_memory() -> (u64, u64) {
 
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
-fn system_memory() -> Option<(u64, u64)> {
+fn system_memory() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
-    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    (m.ullAvailPhys, m.ullAvailPageFile)
 }
 
 /// Whether the address space is walked for the memory map line
@@ -491,82 +530,6 @@ fn system_memory() -> Option<(u64, u64)> {
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
-}
-
-fn schedule_memory_map() -> bool {
-    static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WALKING.swap(true, Relaxed) {
-        return false;
-    }
-    let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
-        log_memory_map();
-        WALKING.store(false, Relaxed);
-    });
-    if walk.is_err() {
-        WALKING.store(false, Relaxed);
-        return false;
-    }
-    true
-}
-
-pub(crate) fn memory_timeline_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMELINE").is_some_and(|v| v == "1"))
-}
-
-/// Sample across long frames without relying on the thread that presents.
-pub(crate) fn start_memory_timeline() {
-    static START: std::sync::Once = std::sync::Once::new();
-    START.call_once(|| {
-        if !memory_timeline_enabled() {
-            return;
-        }
-        let task = std::thread::Builder::new().name("victory-memory-timeline".into()).spawn(|| {
-            let mut map_at = 4 << 30;
-            loop {
-                if let Some((available_ram, commit_headroom)) = system_memory() {
-                    let (working, private) = process_memory();
-                    let (pipelines_made, pipelines_loaded) = crate::pipeline::frame_log_counts();
-                    let frame = crate::frame::current();
-                    let (reserved_window_mapped_bytes, reserved_window_heap_bytes) = crate::host::reserved_window_usage();
-                    tracing::info!(
-                        frame,
-                        private_bytes = private,
-                        working_set_bytes = working,
-                        available_ram_bytes = available_ram,
-                        commit_headroom_bytes = commit_headroom,
-                        logical_staging_bytes = crate::texture::staging_live_bytes(),
-                        logical_list_upload_bytes = crate::host::ALIVE[7].load(Relaxed),
-                        logical_scratch_bytes = crate::host::ALIVE[2].load(Relaxed),
-                        logical_host_texture_bytes = crate::resource::HOST_TEXTURES[1].load(Relaxed),
-                        host_texture_families = ?crate::resource::texture_activity(),
-                        tiled_mapped_bytes = crate::tiles::STATS[2].load(Relaxed),
-                        tiled_heap_bytes = crate::tiles::STATS[3].load(Relaxed),
-                        requested_upload_bytes = crate::host::MADE[1].load(Relaxed),
-                        requested_shared_bytes = crate::host::MADE[3].load(Relaxed),
-                        file_window_staging_bytes = crate::shadow::WINDOW_FILE_STAGING.load(Relaxed),
-                        reserved_window_virtual_bytes = crate::shadow::RESERVED_WINDOW_BYTES.load(Relaxed),
-                        reserved_window_mapped_bytes,
-                        reserved_window_mapped_by_first_requester = ?crate::reserved_windows::mapped_by_source(),
-                        reserved_window_heap_bytes,
-                        loose_windows = ?crate::shadow::window_activity(),
-                        pipelines_made,
-                        pipelines_loaded,
-                        active_library_calls = ?crate::pipeline::active_library_calls(),
-                        "memory timeline"
-                    );
-                    if map_at > 0 && commit_headroom <= map_at && memory_map() && schedule_memory_map() {
-                        tracing::info!(frame, commit_headroom, threshold_bytes = map_at, "memory map requested by timeline");
-                        map_at = if map_at == 4 << 30 { 2 << 30 } else { 0 };
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        });
-        if let Err(error) = task {
-            tracing::warn!(%error, "memory timeline could not start");
-        }
-    });
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
@@ -754,18 +717,33 @@ fn log_memory_map() {
     );
 }
 
+pub(crate) fn memory_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMELINE").is_some_and(|v| v == "1"))
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
-    let (free, left) = system_memory().unwrap_or_default();
+    let (free, left) = system_memory();
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
+    if memory_timeline_enabled() {
+        let (mapped, heaps) = crate::host::reserved_window_usage();
+        tracing::info!(
+            reserved_window_virtual_bytes = crate::shadow::RESERVED_WINDOW_BYTES.load(Relaxed),
+            reserved_window_mapped_bytes = mapped,
+            reserved_window_heap_bytes = heaps,
+            reserved_window_mapped_by_first_requester = ?crate::reserved_windows::mapped_by_source(),
+            "reserved buffer windows"
+        );
+    }
     let stagings = crate::texture::let_go();
     let census = crate::resource::census();
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
@@ -780,8 +758,15 @@ fn log_memory() {
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
-    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 {
-        schedule_memory_map();
+    static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
+        let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+            log_memory_map();
+            WALKING.store(false, Relaxed);
+        });
+        if walk.is_err() {
+            WALKING.store(false, Relaxed);
+        }
     }
     let kept = crate::pipeline::kept();
     tracing::info!(
@@ -818,6 +803,10 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    {
+        let [textures, staging] = crate::pool::memory();
+        tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -884,7 +873,7 @@ fn log_memory() {
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
     let views = crate::descriptor::views_kept();
-    let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
+    let own: Vec<u64> = (0..8).map(owned).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
@@ -1050,12 +1039,11 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
-    let ns = started.elapsed().as_nanos() as u64;
+    let took = started.elapsed();
+    let ns = took.as_nanos() as u64;
+    crate::timeline::called(took);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
-    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
-    crate::framelog::add(crate::framelog::T::RecordNs, ns);
-    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1069,12 +1057,6 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
-    if crate::framelog::on() {
-        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
-        if crate::framelog::on_slow_core() {
-            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
-        }
-    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1087,6 +1069,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
 /// submission lock).
 pub(crate) fn submission_begins() {
     let now = now_us();
+    INSIDE.fetch_add(1, Relaxed);
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
         add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
@@ -1107,6 +1090,7 @@ pub(crate) fn submission_begins() {
 /// submission lock.
 pub(crate) fn submission_ends(lock: u64) {
     let now = now_us();
+    INSIDE.fetch_sub(1, Relaxed);
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
     let (u, k) = ENTERED.with(|e| e.get());
@@ -1118,6 +1102,22 @@ pub(crate) fn submission_ends(lock: u64) {
     s.lock += lock;
     s.inside_user += user.saturating_sub(u);
     s.inside_kernel += kernel.saturating_sub(k);
+}
+
+/// The submissions being prepared now.
+static INSIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What the frame is at, for the sampling profiler (`VICTORY_PROFILE`): 3
+/// in a submission, else 0 after a present until the first list call, 1 until
+/// the first submission, 2 behind it.
+pub(crate) fn phase() -> u32 {
+    if INSIDE.load(Relaxed) > 0 {
+        3
+    } else if SUBMITTED_SINCE.load(Relaxed) {
+        2
+    } else {
+        u32::from(RECORDED_SINCE.load(Relaxed))
+    }
 }
 
 /// The title calls its present (before our own copy to the window runs).
@@ -1153,15 +1153,12 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
-    let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
+    let counted = taken(C::Frames as usize);
     let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -1169,7 +1166,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1193,6 +1190,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        c[C::TexHot as usize],
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
@@ -1226,6 +1224,18 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
+    tracing::info!(
+        "waits for the write trackers' locks per frame, all threads (number, time): {}",
+        crate::watch::lock_waits(frames)
+    );
+    let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "the title's writes beside the guards, since the start: {copies} copies (VICTORY_COPY_BESIDE=1), {blocks} blocks, {opened} opened; \
+         {stores} stores (VICTORY_STORE_BESIDE=1), {unknown} not understood, {full} blocks opened for too many; left out for changing nothing: {stayed} stores, {copied_same} parts of copies, {records} copies of descriptors; \
+         the busiest stores (left out/changed): {}",
+        crate::titlewrite::busiest()
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
@@ -1348,15 +1358,6 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
-    tracing::info!(
-        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
-         out of the submissions' askings ahead: {:.0}",
-        c[C::WatchFailed as usize],
-        c[C::WatchKnownView as usize],
-        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
-    );
-    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

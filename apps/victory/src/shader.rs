@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use victory_game::sgd5;
 use victory_shader::gfx10::{self, Instruction};
-use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, container_programs};
+use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
@@ -42,15 +42,38 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
-        let container = Container::parse(&data[offset..]).ok()?;
-        Some(Source::Raw {
-            offset,
-            data: container.as_bytes(),
-        })
-    });
+    let raw = memchr::memmem::find_iter(data, b"DXBC")
+        .filter_map(|offset| {
+            let tail = &data[offset..];
+            // DXBC total size, validated below. Hash the container, not the
+            // rest of its carrier, so offline warming uses the runtime key.
+            let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+            let data = tail.get(..size)?;
+            Container::parse(data).ok()?;
+            Some(Source::Raw { offset, data })
+        });
     out.extend(raw);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sources;
+
+    #[test]
+    fn embedded_containers_keep_runtime_hashes() {
+        // A 32-byte DXBC with no parts; the scan should not add carrier bytes.
+        let shader = b"DXBC\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\x20\0\0\0\0\0\0\0";
+        let first = [b"MZ".as_slice(), shader, b"first suffix"].concat();
+        let second = [b"PE header".as_slice(), shader, b"other suffix", b"DXBC"].concat();
+        let runtime_hash = blake3::hash(shader);
+        for (carrier, label) in [(&first, "@0x2"), (&second, "@0x9")] {
+            let entries = sources(carrier);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].label(), label);
+            assert_eq!(blake3::hash(&entries[0].bytes().unwrap()), runtime_hash);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -102,20 +125,23 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
-                let native = match (dxil.is_some() || container.part(FourCC::ACCC).is_some())
-                    .then(|| container_programs(&container))
-                {
+                let native = match dxil.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -125,9 +151,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -172,7 +195,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
@@ -227,27 +252,4 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_sources_end_at_each_declared_container_boundary() {
-        let container = |marker: u8| {
-            let mut bytes = vec![0; 32];
-            bytes[..4].copy_from_slice(b"DXBC");
-            bytes[4] = marker;
-            bytes[24..28].copy_from_slice(&32u32.to_le_bytes());
-            bytes
-        };
-        let first = container(1);
-        let second = container(2);
-        let data = [b"prefix".as_slice(), &first, &second, b"trailing"].concat();
-        let found = sources(&data);
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].bytes().unwrap().as_ref(), first);
-        assert_eq!(found[1].bytes().unwrap().as_ref(), second);
-    }
 }

@@ -229,12 +229,12 @@ impl Backing {
 
     /// Record the footprint in CPU state. Only submission preparation
     /// touches the queue or publishes physical mappings.
-    pub(crate) fn request(&mut self, from: usize, to: usize, source: RequestSource) {
+    pub(crate) fn request(&mut self, from: usize, to: usize, source: RequestSource) -> bool {
         #[cfg(not(feature = "diagnostics"))]
         let _ = source;
         debug_assert!(from <= to && to <= self.width);
-        if from == to || self.mapped_count as usize == self.tiles.len() {
-            return;
+        if from >= to || self.mapped_count as usize == self.tiles.len() {
+            return false;
         }
         for (index, tile) in self
             .tiles
@@ -254,6 +254,7 @@ impl Backing {
                 self.requested = true;
             }
         }
+        self.requested
     }
 
     /// Map every requested tile. Ranges returned are

@@ -71,7 +71,9 @@ pub(crate) fn directory() -> Option<&'static Path> {
             tracing::warn!("file-backed card staging is available on native Windows");
             return None;
         }
-        if crate::host::late() || crate::host::relay() || crate::queue2::bits() != 0 {
+        let copy_queues_requested = std::env::var("VICTORY_QUEUE2").ok()
+            .and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(0) & 3 != 0;
+        if crate::host::late() || crate::host::relay() || copy_queues_requested {
             tracing::warn!(
                 "file-backed card staging requires synchronous direct-queue submissions"
             );

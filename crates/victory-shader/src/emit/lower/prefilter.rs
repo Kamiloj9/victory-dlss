@@ -150,7 +150,7 @@ pub(super) fn try_lower(x: &Parts) -> Option<super::Lowered> {
     let before = NEEDS.with_borrow(Vec::len);
     let mut bad = HashMap::new();
     loop {
-        let result = Lower::new(&parts, &bad, false, true).run();
+        let result = Lower::new(&parts, &bad, false, true).run(false);
         NEEDS.with_borrow_mut(|n| n.truncate(before));
         match result {
             Ok(l) => return Some(l),
@@ -272,7 +272,8 @@ mod tests {
             TEST_VIEW_LIMIT.set(Some(limit));
             TEST_PREFILTER.set(Some(false));
             let baseline = translate(&bytes).unwrap();
-            assert_eq!(wave_bounds(&baseline.dxil), [64, 64]);
+            // The NVIDIA renderer also has a general Wave32 fallback without a dispatch contract.
+            assert_eq!(wave_bounds(&baseline.dxil), [32, 32]);
             assert_eq!(baseline.dispatch_contract, DispatchContract::None);
             TEST_PREFILTER.set(Some(true));
             let shader = translate(&bytes).unwrap();

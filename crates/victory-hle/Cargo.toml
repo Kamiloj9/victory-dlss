@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+victory-core.workspace = true
 victory-gpu.workspace = true
 victory-loader.workspace = true
 victory-pe.workspace = true
@@ -17,14 +18,18 @@ zlib-rs.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-victory-core.workspace = true
 windows-sys = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Power",

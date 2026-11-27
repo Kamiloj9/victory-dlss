@@ -1,0 +1,400 @@
+//! Two presented planes as one image: the console's display puts the second
+//! (the interface) over the first (the scene), each scaled to the screen.
+//! Grand Theft Auto VI presents so on Series S.
+
+use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::s;
+
+use crate::host::Host;
+
+const SOURCE: &str = r#"
+Texture2D<float4> scene : register(t0);
+Texture2D<float4> over : register(t1);
+SamplerState smooth_ : register(s0);
+struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.uv = float2((id << 1) & 2, id & 2);
+    v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return v;
+}
+float4 ps(V v) : SV_Target {
+    float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+}
+"#;
+
+pub(crate) struct Composer {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    views: Vec<ID3D12DescriptorHeap>,
+    step: u32,
+}
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Composer {}
+// SAFETY: as above.
+unsafe impl Sync for Composer {}
+
+/// Wine's system HLSL compiler can omit the embedded root signature (#188).
+/// Describe the two adjacent plane SRVs and their sampler to D3D12 directly.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        ..Default::default()
+    };
+    let table = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &range,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        ..Default::default()
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: 1,
+        pParameters: &table,
+        NumStaticSamplers: 1,
+        pStaticSamplers: &sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    // SAFETY: the description and its members stay live during serialization.
+    // The device reads the serialized signature while its blob is still live.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
+impl Composer {
+    pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        let (vs, ps) = (
+            crate::host::compile(SOURCE, s!("vs"), s!("vs_5_1"))?,
+            crate::host::compile(SOURCE, s!("ps"), s!("ps_5_1"))?,
+        );
+        let device = &host.device;
+        let root = root_signature(device)?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        // SAFETY: the signature and shader bytes live through PSO creation.
+        unsafe {
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs),
+                PS: code(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = format;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso = device.CreateGraphicsPipelineState(&desc)?;
+            Ok(Composer {
+                root,
+                pso,
+                views: Vec::new(),
+                step: device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            })
+        }
+    }
+
+    /// Each presenter command-list slot owns its own pair of SRVs. The swap
+    /// chain may have several outstanding presents; the slot is selected by
+    /// the completion fence, and its descriptors are only overwritten on reuse.
+    pub(crate) fn record(
+        &mut self,
+        host: &Host,
+        slot: usize,
+        list: &ID3D12GraphicsCommandList,
+        planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+        back: &ID3D12Resource,
+        (width, height): (u32, u32),
+    ) -> windows::core::Result<()> {
+        while self.views.len() <= slot {
+            let heap = unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 2,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })?
+            };
+            self.views.push(heap);
+        }
+        let views = &self.views[slot];
+        // SAFETY: an open list; the views are made in slots no frame in flight
+        // reads; live textures.
+        unsafe {
+            let (cpu, gpu) = (
+                views.GetCPUDescriptorHandleForHeapStart(),
+                views.GetGPUDescriptorHandleForHeapStart(),
+            );
+            for (i, plane) in planes.iter().enumerate() {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu.ptr + (i * self.step as usize),
+                };
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: plane.1,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MipLevels: 1,
+                            ..Default::default()
+                        },
+                    },
+                };
+                host.device
+                    .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
+            }
+            let rtv = host.rtv(Some(back), None);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.SetGraphicsRootSignature(&self.root);
+            list.SetPipelineState(&self.pso);
+            list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.IASetPrimitiveTopology(
+                windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            );
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: width as f32,
+                Height: height as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }]);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        Ok(())
+    }
+}
+
+/// Select a legal float-sampled view of a display plane, preserving a typed
+/// resource's format. Typeless resources use the corresponding display type.
+pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.DepthOrArraySize != 1
+        || d.SampleDesc.Count != 1
+        || d.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+    {
+        return None;
+    }
+    match d.Format.0 {
+        9 => Some(DXGI_FORMAT_R16G16B16A16_FLOAT),
+        23 => Some(DXGI_FORMAT_R10G10B10A2_UNORM),
+        27 => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+        90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+        10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn composes_scaled_premultiplied_plane_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping display-plane readback: no D3D12 device");
+            return;
+        };
+        check_composite(host);
+    }
+
+    #[test]
+    #[ignore = "requires WARP, the D3D12 debug layer and GPU-based validation"]
+    fn warp_premultiplied_overlay_readback() {
+        for flag in [
+            "VICTORY_D3D12_WARP",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_D3D12_GBV",
+        ] {
+            assert!(crate::switch::on(flag), "{flag} is required");
+        }
+        // SAFETY: valid COM interface output and adapter queries.
+        unsafe {
+            let mut debug: Option<ID3D12Debug1> = None;
+            D3D12GetDebugInterface(&mut debug).expect("GPU-based validation interface");
+            let host = crate::host::host().expect("WARP D3D12 host");
+            let warp = crate::host::warp_adapter().unwrap().GetDesc().unwrap();
+            assert_eq!(host.device.GetAdapterLuid(), warp.AdapterLuid);
+            host.device
+                .cast::<ID3D12InfoQueue>()
+                .expect("active debug layer");
+            check_composite(host);
+            assert_eq!(
+                host.log_messages(),
+                None,
+                "D3D12 reported a validation error"
+            );
+        }
+    }
+
+    fn check_composite(host: &Host) {
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut compositor = Composer::new(host, format).unwrap();
+        let list = host.new_list().unwrap();
+        let texture = |width: u64, height: u32| -> ID3D12Resource {
+            let mut resource = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut resource,
+                    )
+                    .unwrap()
+            };
+            resource.unwrap()
+        };
+        // Scale both planes. The overlay's top row has three alpha levels;
+        // its bottom row is transparent. The two middle output rows interpolate.
+        let base = texture(1, 1);
+        let overlay = texture(3, 2);
+        let output = texture(3, 4);
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let cmds = &list.list;
+        unsafe {
+            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
+            let overlay_rtv = host.rtv(Some(&overlay), None);
+            cmds.ClearRenderTargetView(overlay_rtv, &[0.0; 4], None);
+            let colors = [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.5, 0.0, 0.5],
+                [0.0, 0.0, 1.0, 1.0],
+            ];
+            for (i, color) in colors.iter().enumerate() {
+                let rect = windows::Win32::Foundation::RECT {
+                    left: i as i32,
+                    right: i as i32 + 1,
+                    top: 0,
+                    bottom: 1,
+                };
+                cmds.ClearRenderTargetView(overlay_rtv, color, Some(&[rect]));
+            }
+            cmds.ResourceBarrier(&[
+                crate::host::transition(&base, target, read),
+                crate::host::transition(&overlay, target, read),
+            ]);
+            compositor
+                .record(
+                    host,
+                    0,
+                    cmds,
+                    [(&base, format), (&overlay, format)],
+                    &output,
+                    (3, 4),
+                )
+                .unwrap();
+            cmds.ResourceBarrier(&[crate::host::transition(
+                &output,
+                target,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let (buffer, footprint) =
+                crate::capture::read_back(&host.device, cmds, &output).unwrap();
+            list.close();
+            // Host::execute drains the validation messages. Submit directly so
+            // the WARP gate can inspect every message after completion.
+            let queue: ID3D12CommandQueue = host
+                .device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.ExecuteCommandLists(&[Some(cmds.cast().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence
+                .SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default())
+                .unwrap();
+            host.device.GetDeviceRemovedReason().unwrap();
+            let mut mapped = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let start = mapped.cast::<u8>().add(footprint.Offset as usize);
+            let expected = [
+                [128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255],
+                [128, 0, 0, 255, 80, 96, 0, 255, 32, 0, 191, 255],
+                [128, 0, 0, 255, 112, 32, 0, 255, 96, 0, 64, 255],
+                [128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255],
+            ];
+            for (y, expected) in expected.iter().enumerate() {
+                let row = std::slice::from_raw_parts(
+                    start.add(y * footprint.Footprint.RowPitch as usize),
+                    12,
+                );
+                for (&actual, &expected) in row.iter().zip(expected) {
+                    assert!(
+                        actual.abs_diff(expected) <= 1,
+                        "unexpected RGBA in row {y}: {row:?}"
+                    );
+                }
+            }
+            buffer.Unmap(0, None);
+        }
+    }
+}
