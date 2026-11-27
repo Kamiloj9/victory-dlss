@@ -75,6 +75,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -377,6 +378,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             .map(|&w| super::StaticSampler::from_words(w))
             .collect();
         let shader = HostShader {
+            dispatch_contract: crate::emit::DispatchContract::None,
             stage: HwStage::Cs,
             dxil: lowered.dxil,
             user_data: lowered.user_data,

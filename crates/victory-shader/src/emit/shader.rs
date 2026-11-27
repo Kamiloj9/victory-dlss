@@ -155,6 +155,19 @@ pub(crate) struct Geometry {
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_VIEW_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn view_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_VIEW_LIMIT.get() {
+        return limit;
+    }
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
@@ -488,7 +501,7 @@ impl Shader {
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
-        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
+        let limit = if bounded { 0 } else { view_limit() };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -529,7 +542,16 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_checked(None, None)
+            .expect("ordinary shader serialization")
+    }
+
+    pub(super) fn finish_checked(
+        mut self,
+        snapshot_slot: Option<u32>,
+        prefilter: Option<&(V, V, [V; 11])>,
+    ) -> Option<Vec<u8>> {
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.
@@ -580,6 +602,14 @@ impl Shader {
         let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
+        }
+        if snapshot_slot.is_some() && !self.m.certifies_split_lds(snapshot_slot) {
+            return None;
+        }
+        if prefilter
+            .is_some_and(|(gate, ready, waits)| !self.m.certifies_prefilter(*gate, *ready, waits))
+        {
+            return None;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -956,7 +986,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        Some(container::build(&parts))
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

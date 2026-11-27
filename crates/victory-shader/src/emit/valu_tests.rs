@@ -172,6 +172,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     .expect("lower");
 
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1910,6 +1911,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        dispatch_contract: crate::emit::DispatchContract::None,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -2119,6 +2121,7 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
     })
     .expect("lower");
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -2389,5 +2392,120 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
                 .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
             assert_eq!(out[0], want, "{backend} {label}: buffer_load_format_x mismatch");
         }
+    }
+}
+
+/// `v_fmac_f32` in the VOP3 encoding takes `neg[2]` (`-acc`) and `abs[2]` (`|acc|`) on its
+/// accumulator, the destination register (upstream #3158). The rows are measured on RDNA2
+/// (gfx1031, IEEE mode off, f32 denormals flushed) as published by the AnyPS5 project
+/// (`VFmacF32AccumulatorModifiers.cpp`, 85129d854d); a NaN is compared as any NaN, as hosts
+/// give NaNs bits of their own.
+#[test]
+fn v_fmac_f32_takes_the_accumulator_modifiers() {
+    // ([a, b, acc], with neg[2], with abs[2])
+    const ROWS: [([u32; 3], u32, u32); 16] = [
+        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000], 0x3F80_0000, 0x4040_0000),
+        ([0x3F80_0000, 0x4000_0000, 0xBF80_0000], 0x4040_0000, 0x4040_0000),
+        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000], 0x4140_0000, 0x4140_0000),
+        ([0x4000_0000, 0xC040_0000, 0xC0C0_0000], 0x0000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x0000_0000], 0x8000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x8000_0000], 0x0000_0000, 0x0000_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000], 0xFF80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x7F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7FC0_0001], 0xFFC0_0001, 0x7FC0_0001),
+        ([0x3F80_0000, 0x3F80_0000, 0xFFA0_0000], 0x7FA0_0000, 0x7FA0_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x0000_0001], 0x3F80_0000, 0x3F80_0000),
+        ([0x0080_0000, 0x3F80_0000, 0x8080_0001], 0x0100_0000, 0x0100_0000),
+        ([0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000], 0x4000_0000, 0x4000_0000),
+        ([0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF], 0x7F80_0000, 0x7F80_0000),
+        ([0xBF80_0000, 0x4000_0000, 0x4000_0000], 0xC080_0000, 0x0000_0000),
+    ];
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let cases: Vec<[u32; 4]> = ROWS.iter().map(|&([a, b, acc], _, _)| [a, b, acc, 0]).collect();
+    for (label, abs, neg) in [("neg[2]", 0, 4), ("abs[2]", 4, 0)] {
+        // v_mov_b32 v5, v3; v_fmac_f32 v5, v1, v2 (VOP3, the modifier on src2); v_mov_b32 v0, v5
+        let mut body = vec![vop1(0x001, 5, vgpr(3))];
+        body.extend(vop3_mod(0x12B, 5, vgpr(1), vgpr(2), 0, abs, neg, 0, false));
+        body.push(vop1(0x001, 0, vgpr(5)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let want = if neg != 0 { ROWS[i].1 } else { ROWS[i].2 };
+            assert!(
+                got == want || nan(got) && nan(want),
+                "{backend}: {label} row {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+#[test]
+#[ignore = "requires VICTORY_PREFILTER_CAPTURE, VICTORY_SPLIT_PREFILTER=1, and Wave32 hardware"]
+fn captured_prefilter_dispatch_respects_tile_bounds() {
+    use super::DispatchContract;
+    use super::host::Stride;
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::var_os("VICTORY_PREFILTER_CAPTURE").expect("local prefilter capture");
+    let container = std::fs::read(path).expect("read prefilter capture");
+    let previous = lower::TEST_HOST_WAVE.replace(Some(32));
+    let previous_limit = super::shader::TEST_VIEW_LIMIT.replace(Some(999_999));
+    let shader = super::translate(&container);
+    super::shader::TEST_VIEW_LIMIT.set(previous_limit);
+    lower::TEST_HOST_WAVE.set(previous);
+    let shader = shader.expect("translate captured prefilter");
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!([20, 24].map(|offset| crate::dxbc::u32_at(psv, offset).unwrap()), [32, 32]);
+    assert_eq!(shader.dispatch_contract, DispatchContract::Prefilter);
+    let host = Host::new(false).expect("Wave32 hardware");
+    let (root, pso) = host.compute_pipeline(&shader).expect("prefilter pipeline");
+
+    const LOCAL_TABLE: u32 = 160;
+    let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+    for data in &shader.user_data {
+        constants[data.index as usize] = match (data.root, data.slot) {
+            (RootType::Table, 0) => 0,
+            (RootType::Table, 1) => LOCAL_TABLE * 32,
+            (RootType::Constants, 2) => 5,
+            (root, slot) => panic!("unexpected prefilter user data {root:?} at slot {slot}"),
+        };
+    }
+
+    let raw = [1.0f32.to_bits(); 4];
+    let color: [[f32; 4]; 32 * 32] = std::array::from_fn(|i| {
+        [0.125 + (i % 32) as f32 / 64.0, 0.125 + (i / 32) as f32 / 64.0, 0.25, 1.0]
+    });
+    let dispatch = |width: u32, height: u32, groups: [u32; 3]| {
+        let mut cbv = [0; 20];
+        cbv[0] = width;
+        cbv[1] = height;
+        cbv[6] = (1.0f32 / 32.0).to_bits();
+        cbv[7] = cbv[6];
+        cbv[14] = 1;
+        let mut views = (0..LOCAL_TABLE)
+            .map(|_| View::Buffer { data: &raw, stride: Stride::Raw })
+            .collect::<Vec<_>>();
+        views[159] = View::Texture(1, 1, &color[..1]);
+        views.extend([
+            View::Texture(32, 32, &color), View::Texture(32, 32, &color), View::Texture(32, 32, &color),
+            View::TextureUav(4, 4), View::TextureUav(16, 16), View::TextureUav(64, 64),
+            View::TextureUav(32, 32), View::TextureUav(2, 2), View::TextureUav(8, 8),
+            View::Cbv(&cbv),
+        ]);
+        host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone()))],
+            views: &views,
+            samplers: &[],
+            groups,
+        }).expect("prefilter dispatch and readback")
+    };
+    let valid = dispatch(16, 16, [1, 1, 1]);
+    assert_eq!(valid.len(), 6);
+    assert!(valid.iter().all(|mip| mip.iter().any(|&value| value != 0)));
+    assert!(valid.iter().flatten().all(|&value| f32::from_bits(value).is_finite()));
+    assert_eq!(dispatch(16, 16, [2, 2, 1]), valid);
+    for (width, height) in [(0, 16), (16, 0), (8, 16), (16, 4)] {
+        assert!(dispatch(width, height, [1, 1, 1]).iter().flatten().all(|&value| value == 0));
     }
 }

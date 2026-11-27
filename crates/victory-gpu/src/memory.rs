@@ -312,6 +312,8 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return None;
         }
+        // A shader may reach any page assigned to this buffer's directory entry.
+        shadow.require_full_gpu_backing(crate::reserved_windows::RequestSource::ShaderAddress);
         self.copies.push(shadow);
         let n = self.copies.len() - 1;
         self.numbers.insert(key, n);

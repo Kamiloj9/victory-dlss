@@ -412,10 +412,23 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Restrictions on an executing compute dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchContract {
+    None,
+    /// Direct dispatch with one X group and an immutable table CBV.
+    Visibility,
+    /// Experimental prefilter: unaligned dimensions suppress the whole dispatch.
+    /// Requires a direct dispatch with Z = 1 and an immutable 80-byte CBV.
+    Prefilter,
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// Execution and immutable binding requirements for this compute shader.
+    pub dispatch_contract: DispatchContract,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -614,6 +627,14 @@ pub fn emit(
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
                 }
+            }
+        }
+        // Keep this form opt-in until its output is verified on hardware.
+        if std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1") {
+            let again = paired_wave(c, native, p, io, res);
+            report("paired lanes", &again);
+            if let Ok((shader, Some(32))) = again {
+                return Ok(shader);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
@@ -896,6 +917,57 @@ fn widen(
     }
 }
 
+/// One full console wave in one host wave, with both logical lanes of each
+/// thread following the same control flow and their side effects guarded by EXEC.
+fn paired_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    const GROUP: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "paired lanes require one full console wave without shared memory",
+    };
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(GROUP);
+    };
+    if cs.threads.into_iter().try_fold(1u32, u32::checked_mul) != Some(64) || cs.lds_bytes() != 0 {
+        return Err(GROUP);
+    }
+    if let Some(inst) = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
+        let name = i.name();
+        matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+            || name.contains("barrier")
+            || matches!(i.fields, crate::gfx10::Fields::Smem { .. })
+                && (name.contains("store") || name.contains("atomic"))
+    }) {
+        return Err(ShaderError::Unsupported {
+            offset: inst.machine.offset,
+            what: "paired lanes with shared memory, a barrier or a scalar memory write",
+        });
+    }
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let count = wide.len();
+        wide.extend(st.exits.iter().enumerate().filter_map(|(b, exit)| {
+            let structure::LaneExit::Branch { when, .. } = exit else {
+                return None;
+            };
+            st.bools
+                .support(*when)
+                .iter()
+                .any(|a| !matches!(a, structure::Atom::Uniform(_)))
+                .then_some(b)
+        }));
+        if wide.len() == count {
+            return lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res));
+        }
+    }
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -998,6 +1070,7 @@ fn emit_program(
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        dispatch_contract: l.dispatch_contract,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -1007,7 +1080,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.filter = (s.filter & !0x180) | 0x80;
                 }
                 s
             })
@@ -1642,7 +1715,7 @@ mod tests {
             0xBE81_0380u32, // s_mov_b32 s1, 0
             0xF40C_0000,
             0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
-            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE88_03FF, 0x2000_0000, // s_mov_b32 s8, a minimum-reduction sampler
             0xBE89_0380, // s_mov_b32 s9, 0
             0xBE8A_0380, // s_mov_b32 s10, 0
             0xBE8B_0380, // s_mov_b32 s11, 0
@@ -1714,12 +1787,14 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
 
-        let sampler = StaticSampler::from_words([0; 4]);
+        let words = [0x2000_0000, 0, 0, 0];
+        let sampler = StaticSampler::from_words(words);
         let comparison = StaticSampler {
-            filter: sampler.filter | 0x80,
+            filter: 0x80,
             ..sampler
         };
-        assert_eq!(out.samplers, [[0; 4]; 2]);
+        assert_eq!(sampler.filter, 0x100);
+        assert_eq!(out.samplers, [words; 2]);
         assert_eq!(out.static_samplers, [sampler, comparison]);
         #[cfg(windows)]
         if let Some(path) = super::validator::Validator::default_path() {
@@ -1907,6 +1982,7 @@ mod tests {
             }
         };
         let ps = super::HostShader {
+            dispatch_contract: crate::emit::DispatchContract::None,
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1919,6 +1995,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                dispatch_contract: DispatchContract::None,
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -2528,6 +2605,7 @@ mod tests {
             return;
         };
         let cs = super::HostShader {
+            dispatch_contract: crate::emit::DispatchContract::None,
             stage: super::HwStage::Cs,
             dxil,
             user_data: l.user_data,
@@ -2681,6 +2759,7 @@ mod tests {
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
+                dispatch_contract: DispatchContract::None,
                 stage: super::HwStage::Cs,
                 dxil,
                 user_data: l.user_data,
@@ -3097,6 +3176,7 @@ mod barycentric_tests {
         }
         s.m.terminate(s.entry, Term::Ret);
         let vs = HostShader {
+            dispatch_contract: crate::emit::DispatchContract::None,
             stage: HwStage::Vs,
             dxil: s.finish(),
             user_data: Vec::new(),

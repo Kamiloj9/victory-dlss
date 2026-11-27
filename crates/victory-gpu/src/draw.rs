@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DispatchContract;
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -23,6 +24,104 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+fn dispatch_contract_allows(contract: DispatchContract, groups: [u32; 3]) -> bool {
+    groups.contains(&0) || match contract {
+        DispatchContract::None => true,
+        DispatchContract::Visibility => groups[0] == 1,
+        DispatchContract::Prefilter => groups[2] == 1,
+    }
+}
+
+fn indirect_contract_allows(required: bool, max: u32) -> bool {
+    !required || max == 0
+}
+
+/// A constrained shader must name at least one CBV, all through fixed table
+/// entries whose descriptor offsets are aligned to a title heap slot.
+fn immutable_cbv_metadata(used: &[UsedResource], contract: DispatchContract) -> bool {
+    if contract == DispatchContract::Prefilter && !used.iter().any(|u|
+        u.kind == ResourceType::Cbv && u.root == RootType::Table && u.slot == 1 && u.table_offset_dwords == 72)
+    { return false; }
+    let mut found = false;
+    for u in used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+        found = true;
+        if u.root != RootType::Table || !u.table_offset_dwords.is_multiple_of(8)
+            || u.table_offset_dwords / 8 >= crate::descriptor::host::DYNAMIC
+        {
+            return false;
+        }
+    }
+    found
+}
+
+fn valid_immutable_cbv(address: u64, size: u32, minimum: u32) -> bool {
+    address != 0 && (minimum..=65536).contains(&size)
+        && address.checked_add(u64::from(size)).is_some()
+        && usize::try_from(address).is_ok()
+}
+
+fn immutable_cbv_tables_complete(used: &[UsedResource], made: &[(u8, u32)], contract: DispatchContract) -> bool {
+    immutable_cbv_metadata(used, contract) && !made.iter().any(|m| m.1 == u32::MAX)
+        && used.iter().filter(|u| u.kind == ResourceType::Cbv)
+            .all(|u| made.iter().any(|&(slot, _)| slot == u.slot))
+}
+
+#[cfg(test)]
+mod dispatch_contract_tests {
+    use super::*;
+    #[test]
+    fn direct_contracts_and_noops() {
+        assert!(dispatch_contract_allows(DispatchContract::Visibility, [1, 3, 2]));
+        assert!(!dispatch_contract_allows(DispatchContract::Visibility, [2, 1, 1]));
+        assert!(dispatch_contract_allows(DispatchContract::Prefilter, [2, 3, 1]));
+        assert!(!dispatch_contract_allows(DispatchContract::Prefilter, [1, 1, 2]));
+        assert!(dispatch_contract_allows(DispatchContract::None, [2, 3, 2]));
+        for c in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            assert!(dispatch_contract_allows(c, [0, 3, 2]));
+            assert!(dispatch_contract_allows(c, [2, 0, 2]));
+            assert!(dispatch_contract_allows(c, [2, 3, 0]));
+        }
+        assert!(!indirect_contract_allows(true, 1));
+        assert!(!indirect_contract_allows(true, u32::MAX));
+        assert!(indirect_contract_allows(true, 0));
+        assert!(indirect_contract_allows(false, 1));
+    }
+
+    #[test]
+    fn visibility_still_requires_a_fixed_table_cbv() {
+        let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 96, lower_bound: 7, stride: 0, dwords: 4, user_data: 4, slot: 0 };
+        let contract = DispatchContract::Visibility;
+        assert!(!immutable_cbv_metadata(&[], contract));
+        assert!(immutable_cbv_metadata(&[cbv], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { root: RootType::Descriptor, ..cbv }], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { table_offset_dwords: 97, ..cbv }], contract));
+        assert!(valid_immutable_cbv(0x10010, 16, 16));
+        assert!(!valid_immutable_cbv(0, 16, 16));
+        assert!(!valid_immutable_cbv(0x10000, 15, 16));
+        assert!(!valid_immutable_cbv(0x10000, 65537, 16));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[(0, u32::MAX)], contract));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(0, 64)], contract));
+    }
+
+    #[test]
+    fn prefilter_requires_fixed_cbv_and_80_bytes() {
+        let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 72, lower_bound: 0, stride: 0, dwords: 4, user_data: 0, slot: 1 };
+        assert!(!immutable_cbv_metadata(&[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_metadata(&[cbv], DispatchContract::Prefilter));
+        let mut bad = cbv; bad.slot = 0;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        bad = cbv; bad.table_offset_dwords = 64;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        assert!(!valid_immutable_cbv(0x10000, 79, 80));
+        assert!(valid_immutable_cbv(0x10000, 80, 80));
+        assert!(!valid_immutable_cbv(u64::MAX - 7, 80, 80));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(1, 64)], DispatchContract::Prefilter));
+    }
+}
 
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
@@ -540,14 +639,14 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, host heap id, first,
     /// count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) â†’ dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -719,17 +818,57 @@ fn heap_spread() -> bool {
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 
+/// One heap pass's buffer reads. A sparse backing can keep gaps between
+/// verified views, while an uncertain view retains the bounding refresh.
+struct HeapBufferRanges {
+    bounding: (usize, usize),
+    exact: Option<Vec<(usize, usize)>>,
+}
+
+impl HeapBufferRanges {
+    fn new(from: usize, to: usize, exact: bool) -> Self {
+        Self {
+            bounding: (from, to),
+            exact: exact.then(|| vec![(from, to)]),
+        }
+    }
+
+    fn add(&mut self, from: usize, to: usize, exact: bool) {
+        self.bounding.0 = self.bounding.0.min(from);
+        self.bounding.1 = self.bounding.1.max(to);
+        if !exact {
+            self.exact = None;
+        } else if let Some(ranges) = &mut self.exact {
+            ranges.push((from, to));
+        }
+    }
+
+    fn refreshes(&mut self) -> &[(usize, usize)] {
+        match &mut self.exact {
+            Some(ranges) => {
+                if ranges.len() > 1 {
+                    crate::host::join_ranges(ranges, []);
+                }
+                ranges
+            }
+            None => std::slice::from_ref(&self.bounding),
+        }
+    }
+}
+
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    // Record generations for precisely bounded SRVs on sparse resources.
+    sparse_srv_keys: std::collections::HashMap<u32, u64>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), sparse_srv_keys: Default::default(), unwatched: Default::default() }
     }
 }
 
@@ -1114,7 +1253,7 @@ type TargetKey = (usize, (usize, [u32; 7]));
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+pub(crate) fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -1122,13 +1261,23 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = if srv {
+        crate::shadow::find(address, 1)
+    } else {
+        crate::shadow::find_root_cbv(address)
+    }?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
+        let source = if srv {
+            crate::reserved_windows::RequestSource::Refresh
+        } else {
+            crate::reserved_windows::RequestSource::RootCbv
+        };
+        shadow.refresh_with_source(list, address, len, source);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
         return Some(gpu);
@@ -1170,16 +1319,18 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, sparse_srv_keys, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
+        sparse_srv_keys.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
+        sparse_srv_keys.retain(|index, _| index % parts != part);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
         slots
@@ -1210,7 +1361,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let (view, key) = host.mirror_with_key(index, heap.handle(index)?, true)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
@@ -1219,7 +1370,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        let key = (shadow.has_reserved_backing() && matches!(view, View::Shader(..) | View::Placed(false, ..))).then_some(key);
+        Some(((shadow, address, address.checked_add(len)?), written, key))
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
@@ -1243,7 +1395,12 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let _ = found[n].set(looked);
     });
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
+        if let Some(key) = shows.as_ref().and_then(|(_, _, key)| *key) {
+            sparse_srv_keys.insert(index, key);
+        } else if !sparse_srv_keys.is_empty() {
+            sparse_srv_keys.remove(&index);
+        }
+        let range = shows.map(|(range, written, _)| {
             if written {
                 unordered.push(range.clone());
             }
@@ -1266,7 +1423,23 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         span.1 = span.1.min(*from);
         span.2 = span.2.max(*to);
     }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    // Only opted-in sparse SRVs need their disjoint ranges validated against
+    // the host descriptor. Dense heaps keep their single pass over cached slots.
+    let mut sparse: crate::host::ByCopy<HeapBufferRanges> = Default::default();
+    if !sparse_srv_keys.is_empty() {
+        for (index, slot) in ranges.0.iter().enumerate() {
+            let Some((shadow, from, to)) = slot else { continue };
+            if !shadow.has_reserved_backing() { continue }
+            let (start, width) = shadow.span();
+            let exact = *from >= start && *to - start <= width
+                && sparse_srv_keys.get(&(index as u32)).is_some_and(|&key| host.matches_buffer_slot(index as u32, key, &shadow.buffer));
+            let (from, to) = (*from as usize, *to as usize);
+            sparse.entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .and_modify(|span| span.add(from, to, exact))
+                .or_insert_with(|| HeapBufferRanges::new(from, to, exact));
+        }
+    }
+    let mut bytes = 0u64;
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1280,7 +1453,19 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     });
     let mut found = Vec::with_capacity(spans.len());
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for (key, (shadow, from, to)) in &spans {
+        if let Some(span) = sparse.get_mut(key) {
+            // A new SRV can cover a previously unread hole inside the same
+            // bounds. The dense bounding-range throttle cannot skip this pass.
+            for &(from, to) in span.refreshes() {
+                let (from, to) = (from as u64, to as u64);
+                let end = to.min(from.saturating_add(shadow.left(from)));
+                found.push((shadow.clone(), from, end));
+                bytes += end - from;
+            }
+            continue;
+        }
+        bytes += to - from;
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
             if let Some(&(last, low, high)) = unwatched.get(&id)
@@ -1804,6 +1989,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
@@ -1822,6 +2008,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
@@ -1865,6 +2052,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.begin_command();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1952,12 +2140,29 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let contract = if compute { t.host.dispatch_contract } else { DispatchContract::None };
+            let strict_cbv = contract != DispatchContract::None;
+            if strict_cbv && (!immutable_cbv_metadata(&t.used, contract)
+                || stage.user_data.is_none()
+                || !stage.root_cbvs.is_empty()
+                || t.used.iter().filter(|u| u.kind == ResourceType::Cbv).any(|u| {
+                    !t.host.user_data.iter().any(|data| data.root == RootType::Table && data.slot == u.slot)
+                        || t.host.root_indexed_views.iter().any(|index| index.table_slot == u.slot)
+                }))
+            {
+                once!("constrained dispatch dropped: CBV metadata cannot be staged immutably");
+                return false;
+            }
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, contract);
             STORES.set(true);
+            if strict_cbv && !immutable_cbv_tables_complete(&t.used, &made, contract) {
+                once!("constrained dispatch dropped: required CBV could not be staged");
+                return false;
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1979,7 +2184,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2197,6 +2402,7 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
+            list.buffer_state(&s.buffer, crate::host::BUFFER_WRITE);
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, self.pipeline);
@@ -2351,6 +2557,7 @@ impl State {
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a));
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -3683,6 +3890,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        if [x, y, z].contains(&0) { return; }
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -3718,6 +3926,16 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten();
+        let threads = [x, y, z];
+        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        if !dispatch_contract_allows(p.dispatch_contract(), [x, y, z]) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(x, y, z, contract = ?p.dispatch_contract(), "dispatch dropped: translated shader dispatch contract violated");
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3737,11 +3955,6 @@ impl State {
         // Counted in threads: whole groups of them, and the program is told
         // how many of the last one run, where it asks (its `bind` set that to
         // all of them).
-        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-            .then(|| p.stages.first().and_then(|s| s.translated().threads))
-            .flatten();
-        let threads = [x, y, z];
-        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -3753,6 +3966,18 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if p.dispatch_contract() != DispatchContract::None {
+            static VISIBILITY_LOGGED: std::sync::Once = std::sync::Once::new();
+            static PREFILTER_LOGGED: std::sync::Once = std::sync::Once::new();
+            let logged = match p.dispatch_contract() {
+                DispatchContract::Visibility => &VISIBILITY_LOGGED,
+                DispatchContract::Prefilter => &PREFILTER_LOGGED,
+                DispatchContract::None => unreachable!(),
+            };
+            logged.call_once(|| tracing::info!(x, y, z, pipeline = %p.name,
+                contract = ?p.dispatch_contract(), "constrained compute dispatch recorded"));
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4341,7 +4566,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -4425,7 +4650,9 @@ impl State {
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        contract: DispatchContract,
     ) -> Few<(u8, u32), 16> {
+        let strict_cbv = contract != DispatchContract::None;
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -4492,7 +4719,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let key = (!strict_cbv).then(|| {
                 let mut h = RecordHash::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
@@ -4500,10 +4727,10 @@ impl State {
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
                 (table, n, h.0)
-            };
+            });
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
-            if let Some(known) = self.fresh_tables.get_mut(&key) {
+            if let Some(known) = key.as_ref().and_then(|key| self.fresh_tables.get_mut(key)) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -4539,7 +4766,7 @@ impl State {
                 }
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
-                if once && let Some(known) = self.fresh_tables.get_mut(&key) {
+                if once && let Some(known) = key.as_ref().and_then(|key| self.fresh_tables.get_mut(key)) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
                     let epoch = list.epoch();
@@ -4563,7 +4790,9 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            if let Some(key) = key {
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4577,7 +4806,7 @@ impl State {
                     host.slot_tabled(title + k);
                 }
             }
-            let list_views = crate::descriptor::host::list_views();
+            let list_views = !strict_cbv && crate::descriptor::host::list_views();
             if self.recording == 0 {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -4637,17 +4866,54 @@ impl State {
                     continue;
                 }
                 let used = group.entry(k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let required_cbv = strict_cbv && entries.iter().any(|u|
+                    u.kind == ResourceType::Cbv && u.table_offset_dwords / 8 == k);
+                let handle = table + u64::from(k) * 32;
+                let view = if strict_cbv {
+                    let _mapped = crate::watch::title_memory_reading();
+                    if !crate::texture::committed(handle as *const u8, 12) {
+                        made.push((slot, u32::MAX));
+                        return made;
+                    }
+                    crate::descriptor::view(handle)
+                } else {
+                    crate::descriptor::view(handle)
+                };
+                match view {
                     Some(View::Constant(address, size)) => {
+                        let minimum = if contract == DispatchContract::Prefilter && slot == 1 && k == 9 { 80 } else { 16 };
+                        if required_cbv && (!valid_immutable_cbv(address, size, minimum)
+                            || !crate::texture::committed(address as *const u8, size as usize))
+                        {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                            if required_cbv {
+                                made.push((slot, u32::MAX));
+                                return made;
+                            }
                             host.make_null(index);
                             continue;
                         };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
+                        if required_cbv {
+                            if gpu == 0 || to.is_null() {
+                                made.push((slot, u32::MAX));
+                                return made;
+                            }
+                            // Each constrained dispatch gets its own immutable upload on submission.
+                            list.defer_fill(to, address as *const u8, size as usize);
+                        } else {
+                            let descriptor = (std::ptr::from_ref(heap) as usize, index);
+                            list.defer_constants(to, address as *const u8, size as usize, descriptor);
+                        }
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        if required_cbv {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -4670,6 +4936,10 @@ impl State {
                         }
                     }
                     None => {
+                        if required_cbv {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
@@ -5088,6 +5358,14 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        // GPU-produced indirect arguments cannot be certified while recording.
+        if kind == DISPATCH && p.dispatch_contract() != DispatchContract::None {
+            if !indirect_contract_allows(true, max) {
+                why("translated shader has a dispatch contract; indirect counts are unknown");
+                return false;
+            }
+            return true;
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -5301,6 +5579,9 @@ impl State {
             list.note_op(|| {
                 self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
             });
+            if let Some((shadow, _)) = &counter {
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+            }
             let epoch = list.epoch();
             if joining && call.single && !call.alone {
                 // Held back for the next ones to join.
@@ -5580,6 +5861,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
+        let state = if kind == ResourceType::Uav { crate::host::BUFFER_WRITE } else { crate::host::BUFFER_READ };
+        list.buffer_state(&shadow.buffer, state);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
@@ -5956,5 +6239,90 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod heap_buffer_range_tests {
+    use super::HeapBufferRanges;
+
+    #[test]
+    fn verified_srv_ranges_preserve_the_gap_and_merge_neighbors() {
+        let mut ranges = HeapBufferRanges::new(0x10000, 0x20000, true);
+        ranges.add(0x80000, 0x90000, true);
+        ranges.add(0x20000, 0x30000, true);
+        ranges.add(0x18000, 0x28000, true);
+        assert_eq!(ranges.refreshes(), &[(0x10000, 0x30000), (0x80000, 0x90000)]);
+    }
+
+    #[test]
+    fn a_single_uncertain_range_preserves_the_old_bounding_refresh() {
+        let mut ranges = HeapBufferRanges::new(0x10000, 0x20000, true);
+        ranges.add(0x80000, 0x90000, false);
+        ranges.add(0x50000, 0x60000, true);
+        assert_eq!(ranges.refreshes(), &[(0x10000, 0x90000)]);
+    }
+
+    #[test]
+    #[ignore = "requires a native tiled-resources adapter, sparse windows and file staging"]
+    fn native_bindless_srvs_do_not_refresh_the_tiles_between_them() {
+        use super::*;
+        use crate::{descriptor, object};
+
+        const TILE: usize = 64 << 10;
+        const WINDOW: usize = 4 << 20;
+        let host = crate::host::host().expect("native D3D12 host");
+        let mut memory = vec![0x6a_u8; 2 * WINDOW];
+        let aligned = memory.as_ptr().align_offset(WINDOW);
+        let title = &mut memory[aligned..aligned + WINDOW];
+        let start = title.as_mut_ptr() as u64;
+        let offsets = [TILE, 9 * TILE];
+        let contents = [0x1112_3344_u32, 0xa1b2_6cde];
+        let heap_iid = object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut title_heap = std::ptr::null();
+        let heap_desc = [0u32, 2, 1, 0, 0, 0, 0, 0];
+        assert_eq!(descriptor::create_heap(std::ptr::null(), heap_desc.as_ptr().cast(), &heap_iid, &mut title_heap), 0);
+        let heap = descriptor::heap(title_heap);
+        for (index, offset) in offsets.into_iter().enumerate() {
+            title[offset..offset + 4].copy_from_slice(&contents[index].to_le_bytes());
+            let mut resource = [0; 14];
+            resource[0] = 1;
+            resource[4] = 16;
+            let mut words = [0; 16];
+            words[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            words[6] = 4;
+            words[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+            let address = start + offset as u64;
+            words[10] = address as u32;
+            words[11] = (address >> 32) as u32;
+            descriptor::create_placed_srv(std::ptr::null(), &resource, &words, heap.handle(index as u32).unwrap());
+        }
+
+        let shadow = crate::shadow::find_descriptor(start + offsets[0] as u64, 16).unwrap();
+        assert!(shadow.has_reserved_backing());
+        let readback = host.read_back_buffer(8).unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap]);
+        let before = crate::host::reserved_window_usage().0;
+        assert!(state.heap_buffers(&list).is_some());
+        for (index, offset) in offsets.into_iter().enumerate() {
+            // SAFETY: the source dword and readback slot are inside the allocated buffers.
+            unsafe { list.list.CopyBufferRegion(&readback, index as u64 * 4, &shadow.buffer, offset as u64, 4) };
+        }
+        list.close();
+        host.execute(&[&list]);
+        crate::host::settle_now(crate::host::WHY_SYNC);
+        assert_eq!(crate::host::reserved_window_usage().0 - before, (2 * TILE) as u64);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the synchronous submission initialized both dwords.
+        unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), 2), contents);
+            readback.Unmap(0, None);
+        }
+        assert!(host.log_messages().is_none());
+        object::release(title_heap);
     }
 }

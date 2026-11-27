@@ -717,6 +717,11 @@ fn log_memory_map() {
     );
 }
 
+pub(crate) fn memory_timeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMELINE").is_some_and(|v| v == "1"))
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
@@ -729,6 +734,16 @@ fn log_memory() {
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
+    if memory_timeline_enabled() {
+        let (mapped, heaps) = crate::host::reserved_window_usage();
+        tracing::info!(
+            reserved_window_virtual_bytes = crate::shadow::RESERVED_WINDOW_BYTES.load(Relaxed),
+            reserved_window_mapped_bytes = mapped,
+            reserved_window_heap_bytes = heaps,
+            reserved_window_mapped_by_first_requester = ?crate::reserved_windows::mapped_by_source(),
+            "reserved buffer windows"
+        );
+    }
     let stagings = crate::texture::let_go();
     let census = crate::resource::census();
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
@@ -1212,7 +1227,7 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
-        crate::watch::lock_waits(frames as f64)
+        crate::watch::lock_waits(frames)
     );
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));

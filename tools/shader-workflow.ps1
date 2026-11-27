@@ -127,14 +127,18 @@ try {
     Invoke-Tool $cargo @('test', '--locked', '-p', 'victory-shader', '--lib', '--', '--test-threads=1') 'shader-tests.log'
     $gpu = @('test', '--locked', '-p', 'victory-gpu', '--features', 'diagnostics', '--lib')
     Invoke-Tool $cargo ($gpu + @('descriptor::', '--', '--test-threads=1')) 'descriptor-tests.log'
-    Invoke-Tool $cargo ($gpu + @('warp_file_backed_loose_window_roundtrips_gpu_writes', '--', '--ignored', '--nocapture')) 'warp-gpu-validation.log'
-    # Rasterize and composite a synthetic scene, then verify the RGBA readback.
-    # Cargo also exits successfully if a filter selects zero tests.
-    $pixelTest = 'present_overlay::tests::warp_premultiplied_overlay_readback'
-    Invoke-Tool $cargo ($gpu + @($pixelTest, '--', '--ignored', '--exact', '--nocapture')) 'warp-pixel-readback.log'
-    $pixelLog = Join-Path $report 'warp-pixel-readback.log'
-    if (-not (Select-String -Quiet -LiteralPath $pixelLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
-        throw "The required pixel readback test did not run: $pixelTest"
+    $readbacks = [ordered]@{
+        'host::queue2_tests::warp_file_backed_loose_window_roundtrips_gpu_writes' = 'warp-gpu-validation.log'
+        'compose::tests::warp_premultiplied_overlay_readback' = 'warp-pixel-readback.log'
+        'host::buffer_states::tests::warp_shadow_buffers_switch_between_shader_write_and_read' = 'warp-shadow-state-readback.log'
+    }
+    # Cargo exits successfully when an exact filter selects zero tests.
+    foreach ($test in $readbacks.Keys) {
+        $log = $readbacks[$test]
+        Invoke-Tool $cargo ($gpu + @($test, '--', '--ignored', '--exact', '--nocapture')) $log
+        if (-not (Select-String -Quiet -LiteralPath (Join-Path $report $log) -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
+            throw "The required WARP readback test did not run: $test"
+        }
     }
     if ($corpus.Count) {
         $env:VICTORY_WARP = '1'

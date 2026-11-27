@@ -133,6 +133,7 @@ fn lowered_counted(
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -272,6 +273,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let lowered = lowered.expect("lower");
     assert_eq!(lowered.wave_size, Some(64));
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -761,6 +763,7 @@ fn lowered_with_wave(
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered.expect("lower");
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1009,4 +1012,88 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
         eprintln!("the old rounding on this device: {written} of 64 dwords written");
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+}
+
+const PAIRED_EXEC_MASKS: [u64; 9] = [
+    1, 1 << 31, 1 << 32, 1 << 63, 0xffff_ffff, 0xffff_ffff_0000_0000,
+    0x8000_0000_0000_0001, 0x4000_0120_0000_4000, (1 << 5) | (1 << 37),
+];
+
+/// Each active lane writes the first active logical lane's index.
+#[test]
+#[ignore = "requires Wave32 GPU readback"]
+fn paired_first_active_lane_broadcast_respects_both_halves() {
+    let native = native(&[
+        0xbe8c_2400, // s_and_saveexec_b64 s[12:13], s[0:1]
+        0x7e0e_0500, // v_readfirstlane_b32 s7, v0
+        0x7e0c_0207, // v_mov_b32 v6, s7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xe070_1000, 0x8002_0604, // buffer_store_dword v6, v4, s[8:11], 0 offen
+        0xbefe_040c, // s_mov_b64 exec, s[12:13]
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lower::with_paired_lanes(|| lowered(&native, &p, &HashSet::new()))
+        .expect("paired first-active-lane lowering");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("Wave32 hardware device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("paired lane pipeline");
+    for mask in PAIRED_EXEC_MASKS {
+        let constants = vec![mask as u32, (mask >> 32) as u32, 0, 0, 0, 0, 0, 0];
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))], views: &[View::RawUav(64)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("paired lane readback");
+        let first = mask.trailing_zeros();
+        for lane in 0..64 {
+            let expected = if mask & (1u64 << lane) != 0 { first } else { 0 };
+            assert_eq!(out[0][lane], expected, "mask {mask:#018x}, lane {lane}");
+        }
+    }
+}
+
+/// One selected logical lane performs a returning atomic; all originally
+/// active logical lanes must observe its old value after EXEC is restored.
+#[test]
+#[ignore = "requires Wave32 GPU readback"]
+fn paired_first_active_returning_atomic_broadcasts_once() {
+    let native = native(&[
+        0xbe8c_2400, // s_and_saveexec_b64 s[12:13], s[0:1]
+        0x7e0e_0500, // v_readfirstlane_b32 s7, v0
+        0x7d84_0007, // v_cmp_eq_u32 vcc, s7, v0
+        0xbe8e_246a, // s_and_saveexec_b64 s[14:15], vcc
+        0x7e02_02ff, 0x0000_0100, // v_mov_b32 v1, 256 (counter byte offset)
+        0x7e04_028b, // v_mov_b32 v2, 11
+        // Add the seed to the initially zero counter. A store here
+        // could hide duplicate additions from a wrongly selected lane.
+        0xe0c8_5000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen glc
+        0x7e04_0287, // v_mov_b32 v2, 7
+        0xe0c8_5000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen glc
+        0xbefe_040e, // s_mov_b64 exec, s[14:15]
+        0x7e0e_0502, // v_readfirstlane_b32 s7, v2 (returned old value)
+        0x7e0c_0207, // v_mov_b32 v6, s7
+        0x4a0c_0c85, // v_add_nc_u32 v6, 5, v6
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xe070_1000, 0x8002_0604, // buffer_store_dword v6, v4, s[8:11], 0 offen
+        0xbefe_040c, // s_mov_b64 exec, s[12:13]
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let atomics = p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "buffer_atomic_add");
+    assert_eq!(atomics.count(), 2);
+    let shader = lower::with_paired_lanes(|| lowered(&native, &p, &HashSet::new()))
+        .expect("paired returning atomic lowering");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("Wave32 hardware device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("paired atomic pipeline");
+    for mask in [0].into_iter().chain(PAIRED_EXEC_MASKS) {
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![mask as u32, (mask >> 32) as u32, 0, 0, 0, 0, 0, 0]))],
+            views: &[View::RawUav(65)], samplers: &[], groups: [1, 1, 1],
+        }).expect("paired atomic readback");
+        let total = if mask == 0 { 0 } else { 18 };
+        assert_eq!(out[0][64], total, "each atomic must run once or be masked out, mask {mask:#018x}");
+        for lane in 0..64 {
+            let expected = if mask & (1u64 << lane) != 0 { 16 } else { 0 };
+            assert_eq!(out[0][lane], expected, "mask {mask:#018x}, lane {lane}");
+        }
+    }
 }

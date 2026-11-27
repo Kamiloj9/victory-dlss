@@ -10,6 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::fs::File;
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -402,6 +404,7 @@ const PAGE: usize = 64 << 10;
 
 struct Section {
     handle: HANDLE,
+    backing: Option<File>,
     pages: usize,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
@@ -436,6 +439,9 @@ impl Section {
         if base == 0 {
             return None;
         }
+        if self.backing.is_some() {
+            return Some(base + index * PAGE);
+        }
         let missing = |page: usize| self.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 == 0;
         let mut page = index;
         while page < index + n {
@@ -464,6 +470,9 @@ impl Section {
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
         use std::sync::atomic::Ordering;
+        if self.backing.is_some() {
+            return true;
+        }
         let pages = index..(index + len / PAGE).min(self.pages);
         let bit = |p: usize| (&self.committed[p / 64], 1 << (p % 64));
         let done = || {
@@ -597,21 +606,17 @@ impl Shown {
         }
     }
 
-    /// Where the title sees the page at `slice`: addresses and bytes.
-    fn at(&self, slice: &Slice) -> Vec<(usize, usize)> {
-        let section = Arc::as_ptr(&slice.section) as usize;
-        let mut out: Vec<(usize, usize)> =
-            self.pages.get(&(section, slice.index)).into_iter().flatten().map(|&at| (at, PAGE)).collect();
-        for &(base, len, of, index) in &self.long {
-            if of == section && (index..index + len / PAGE).contains(&slice.index) {
-                out.push((base + (slice.index - index) * PAGE, PAGE));
-            }
-        }
-        out
+    /// All current aliases for a section page, including long views.
+    fn addresses(&self, section: usize, page: usize) -> impl Iterator<Item = usize> + '_ {
+        let short = self.pages.get(&(section, page)).into_iter().flatten().copied();
+        let long = self.long.iter()
+            .filter(move |&&(_, len, of, first)| of == section && (first..first + len / PAGE).contains(&page))
+            .map(move |&(base, _, _, first)| base + (page - first) * PAGE);
+        short.chain(long)
     }
 }
 
-/// See [`pages_written`].
+/// See [`PageRuns::written`].
 pub(crate) fn stream_notice() -> bool {
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("VICTORY_STREAM_NOTICE").is_none_or(|v| v != "0"));
@@ -677,6 +682,19 @@ fn page_table_mut() -> RwLockWriteGuard<'static, Pages> {
     PAGES.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Optional sparse file backing on native Windows; the section owns the file.
+fn physical_backing(size: usize) -> std::io::Result<Option<File>> {
+    static DIRECTORY: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        if on_wine() {
+            return None;
+        }
+        std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR")
+            .filter(|directory| !directory.is_empty())
+            .map(Into::into)
+    });
+    DIRECTORY.as_ref().map(|dir| victory_core::sparse_file::create(dir, size as u64)).transpose()
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -691,19 +709,30 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    let backing = match physical_backing(size) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(n, size, %error, "could not create physical page backing file");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+    };
+    let (storage, section_flags) = if let Some(file) = &backing {
+        (file.as_raw_handle(), 0)
+    } else {
+        (INVALID_HANDLE_VALUE, if on_wine() { SEC_COMMIT } else { SEC_RESERVE })
+    };
     // SAFETY: plain section creation.
     let handle = unsafe {
         CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
+            storage,
             std::ptr::null(),
             // Under Wine a committed section is a sparse file, free until
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | section_flags,
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -726,6 +755,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section {
         handle,
+        backing,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
@@ -797,7 +827,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if slice.section.backing.is_none() && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -848,6 +878,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 }
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
+#[cfg(test)]
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     let table = page_table();
     pages
@@ -855,46 +886,95 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
         .is_some_and(|pages| pages.iter().all(|page| table.pages.contains_key(page)))
 }
 
-/// Where the title sees the pages under bytes `[offset, offset + len)` now,
-/// in order (for the streaming trace: whether that changed while a request
-/// wrote them).
-pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
-    let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
-    let slices: Vec<Slice> = {
-        let table = page_table();
-        numbers.iter().filter_map(|n| table.pages.get(n)).cloned().collect()
-    };
-    let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
-    let mut at: Vec<(usize, usize)> = slices.iter().flat_map(|slice| shown.at(slice)).collect();
-    at.sort_unstable();
-    at
-}
-
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
+#[cfg(test)]
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let k = (n * PAGE - within).min(data.len() - done);
-        if let Some(at) = slice.section.window(slice.index, *n) {
-            // SAFETY: committed bytes of the section's view, which `runs`
-            // holds; the title's other uses of them race as on the console.
-            unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), (at + within) as *mut u8, k) };
-        } else {
-            let Some(mut view) = View::map(slice, *n) else {
-                return false;
-            };
-            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+    resolve_pages(pages, offset, data.len()).is_some_and(|runs| runs.write(data))
+}
+
+/// Section references held from Submit until the request finishes.
+pub(crate) struct PageRuns {
+    runs: Vec<(Slice, usize)>,
+    within: usize,
+    len: usize,
+}
+
+pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Option<PageRuns> {
+    Some(PageRuns { runs: runs(pages, offset, len)?, within: offset % PAGE, len })
+}
+
+impl PageRuns {
+    pub(crate) fn write(&self, data: &[u8]) -> bool {
+        if data.len() > self.len { return false; }
+        let (mut within, mut done) = (self.within, 0);
+        for (slice, n) in &self.runs {
+            if done == data.len() { break; }
+            let k = (n * PAGE - within).min(data.len() - done);
+            if let Some(at) = slice.section.window(slice.index, *n) {
+                // SAFETY: committed bytes of the section's view, which `runs`
+                // holds; the title's other uses of them race as on the console.
+                unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), (at + within) as *mut u8, k) };
+            } else {
+                let Some(mut view) = View::map(slice, *n) else {
+                    break;
+                };
+                view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+            }
+            (within, done) = (0, done + k);
         }
-        (within, done) = (0, done + k);
+        self.written(done);
+        done == data.len()
     }
-    true
+
+    pub(crate) fn window(&self) -> Option<PageWindow> {
+        let [(slice, n)] = self.runs.as_slice() else {
+            return None;
+        };
+        let view = match slice.section.window(slice.index, *n) {
+            Some(at) => Window::Kept(at, slice.section.clone()),
+            None => Window::Own(View::map(slice, *n)?),
+        };
+        Some(PageWindow {
+            view,
+            within: self.within,
+            len: self.len,
+        })
+    }
+
+    pub(crate) fn shown(&self, len: usize) -> Vec<(usize, usize)> {
+        let mut pieces = Vec::new();
+        let mut left = len.min(self.len);
+        let mut within = self.within;
+        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+        for (first, count) in &self.runs {
+            let section = Arc::as_ptr(&first.section) as usize;
+            for k in 0..*count {
+                if left == 0 { break; }
+                let bytes = (PAGE - within).min(left);
+                pieces.extend(shown.addresses(section, first.index + k).map(|at| (at + within, bytes)));
+                left -= bytes;
+                within = 0;
+            }
+        }
+        drop(shown);
+        merge_pieces(pieces)
+    }
+
+    pub(crate) fn written(&self, len: usize) {
+        if len != 0 {
+            for (at, bytes) in self.shown(len) {
+                if stream_notice() {
+                    victory_gpu::kernel_will_write(at, bytes);
+                } else {
+                    victory_gpu::title_memory_written(at, bytes, true);
+                }
+            }
+        }
+    }
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -930,20 +1010,9 @@ impl PageWindow {
 /// `None` otherwise (pages of several allocations, out of order, or
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
+#[cfg(test)]
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    let view = match slice.section.window(slice.index, *n) {
-        Some(at) => Window::Kept(at, slice.section.clone()),
-        None => Window::Own(View::map(slice, *n)?),
-    };
-    Some(PageWindow {
-        view,
-        within: offset % PAGE,
-        len,
-    })
+    resolve_pages(pages, offset, len)?.window()
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -953,29 +1022,12 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 /// addresses sees it. Empty if no view shows them. Byte for byte, not by
 /// whole pages: the title packs several small textures into one page and
 /// fills each with a request of its own.
+#[cfg(test)]
 pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
-    let Some(end) = offset.checked_add(len) else {
-        return Vec::new();
-    };
-    let first = offset / PAGE;
-    let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
-        return Vec::new();
-    };
-    let slices: Vec<Option<Slice>> = {
-        let table = page_table();
-        touched.iter().map(|page| table.pages.get(page).cloned()).collect()
-    };
-    let mut pieces: Vec<(usize, usize)> = Vec::new();
-    {
-        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
-        for (i, slice) in slices.iter().enumerate() {
-            let Some(slice) = slice else { continue };
-            // The bytes of this page that the write covers.
-            let lo = if i == 0 { offset % PAGE } else { 0 };
-            let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(shown.at(slice).into_iter().map(|(at, _)| (at + lo, hi - lo)));
-        }
-    }
+    resolve_pages(pages, offset, len).map(|runs| runs.shown(len)).unwrap_or_default()
+}
+
+fn merge_pieces(mut pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     pieces.sort_unstable();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for (at, bytes) in pieces {
@@ -994,16 +1046,10 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// is copied again. Call when the bytes are there.
 /// `VICTORY_STREAM_NOTICE=0`: not told; what is then done is
 /// `VICTORY_PAGE_WRITES`' to say (`victory_gpu::title_memory_written`).
+#[cfg(test)]
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
-    for (at, bytes) in shown_at(pages, offset, len) {
-        if stream_notice() {
-            victory_gpu::kernel_will_write(at, bytes);
-        } else {
-            victory_gpu::title_memory_written(at, bytes, true);
-        }
+    if let Some(runs) = resolve_pages(pages, offset, len) {
+        runs.written(len);
     }
 }
 
@@ -2813,6 +2859,28 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resolved_page_runs_survive_free_and_keep_aliases_coherent() {
+        let mut pages = [0usize; 1];
+        let mut n = 1;
+        assert_eq!(super::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || super::XMemVirtualAlloc(std::ptr::null_mut(), super::PAGE, 0x2000 | 0x2040_0000, 0, 4);
+        let a = reserve();
+        let b = reserve();
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(super::XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(super::XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        let runs = super::resolve_pages(&pages, 0, 1).unwrap();
+        assert_eq!(super::XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(runs.write(&[0x5a]));
+        // SAFETY: both title views stay mapped until the calls below.
+        unsafe { assert_eq!(*a.cast::<u8>(), 0x5a); assert_eq!(*b.cast::<u8>(), 0x5a); }
+        assert_eq!(super::XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(super::XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+    }
+
+
+
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
@@ -2906,6 +2974,76 @@ mod tests {
         assert_eq!(size_of::<WorkingSet>(), 0x50);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+    }
+
+    #[test]
+    #[ignore = "requires native Windows and VICTORY_PHYSICAL_BACKING_DIR"]
+    fn file_backed_pages_stay_coherent_across_writes_and_remaps() {
+        use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+
+        assert!(!on_wine());
+        let directory = std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR").unwrap();
+        let files = || std::fs::read_dir(&directory).unwrap().count();
+        let before = files();
+        let mut pages = [0usize; 2];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        assert_eq!(n, pages.len());
+        let reserve = || XMemVirtualAlloc(
+            std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+
+        let mut name = [0u16; 1024];
+        // SAFETY: both views are live and name has room for the result.
+        unsafe {
+            assert_ne!(K32GetMappedFileNameW(GetCurrentProcess(), a, name.as_mut_ptr(), name.len() as u32), 0);
+            assert_eq!(a.cast::<u8>().read(), 0);
+        }
+        assert_eq!(files(), before + 1);
+        let mut aliases = vec![(a as usize, 1), (b as usize, 1)];
+        aliases.sort_unstable();
+        assert_eq!(shown_at(&pages[..1], 0, 1), aliases);
+        assert!(write_physical(&pages[..1], 1, &[9]));
+        page_window(&pages[..1], 0, 1).unwrap().bytes()[0] = 7;
+        // SAFETY: both views show the same live page.
+        for view in [a, b] {
+            assert_eq!(unsafe { view.cast::<[u8; 2]>().read() }, [7, 9]);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(query(a).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        // SAFETY: the remapped view is live and points at the untouched page.
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 0);
+        assert!(map_alias(a as u64, b as u64, PAGE as u64));
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        assert_eq!(files(), before + 1, "live views retain the backing after page-number release");
+        // SAFETY: freeing the page numbers does not unmap live views.
+        assert_eq!(unsafe { a.cast::<[u8; 2]>().read() }, [7, 9]);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(files(), before + 1, "the second alias still retains the backing");
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(files(), before, "closing the last view removes the backing file");
+        // SAFETY: only the two reservations owned by the test remain.
+        assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { VirtualFree(b, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    #[ignore = "requires native Windows and VICTORY_PHYSICAL_BACKING_DIR set to a missing directory"]
+    fn missing_physical_backing_directory_reports_allocation_failure() {
+        assert!(!on_wine());
+        let directory = std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR").unwrap();
+        assert!(!std::path::Path::new(&directory).exists());
+        let mut pages = [usize::MAX];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 0);
+        assert_eq!(n, 0);
+        assert_eq!(pages, [usize::MAX]);
     }
 
     #[test]
@@ -3085,7 +3223,7 @@ mod tests {
         assert!(lazy(c));
         assert_eq!(map_pages(c, 3, std::ptr::null(), true), c);
         assert!(!lazy(c));
-        assert!(physical().views.get(&(c as usize)).is_none());
+        assert!(!physical().views.contains_key(&(c as usize)));
         assert_eq!(host(c), MEM_RESERVE);
         assert_eq!(map_pages(c, 3, pages.as_ptr(), false), c);
         // SAFETY: mapped.
@@ -3096,7 +3234,7 @@ mod tests {
         assert_eq!(map_pages(d, 3, pages.as_ptr(), true), d);
         assert_eq!(map_pages(at(d, 1), 1, std::ptr::null(), true), at(d, 1));
         assert!(lazy(d) && lazy(at(d, 2)));
-        assert!(physical().views.get(&(at(d, 1) as usize)).is_none());
+        assert!(!physical().views.contains_key(&(at(d, 1) as usize)));
         assert!(materialize(at(d, 2) as usize, 1));
         assert!(!lazy(at(d, 2)) && lazy(d));
         // SAFETY: mapped now.
@@ -3189,7 +3327,7 @@ mod tests {
         assert_eq!(read(heap, 1), ((true, 1), vec![2]));
         // Unmapped: gone, with no view of the host's ever there.
         assert!(alias_as((heap + PAGE) as u64, 0, PAGE as u64, false, true));
-        assert!(!lazy(heap + PAGE) && physical().views.get(&(heap + PAGE)).is_none());
+        assert!(!lazy(heap + PAGE) && !physical().views.contains_key(&(heap + PAGE)));
         assert_eq!(soft_runs(heap, 4 * PAGE), [(heap, PAGE), (heap + 2 * PAGE, PAGE)]);
         assert_eq!(read(heap + PAGE, 2 * PAGE).0, (false, PAGE));
         // The CPU touches one: the handler maps it with its page's bytes,

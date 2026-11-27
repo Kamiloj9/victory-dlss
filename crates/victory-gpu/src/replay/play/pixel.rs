@@ -492,8 +492,7 @@ impl Player {
         &self,
         spots: &[Spot],
         first: u64,
-        states: &States,
-        t: &Textures,
+        (states, t): (&States, &Textures),
         copied: bool,
         scratch: &mut u64,
         out: &mut Vec<Cmd>,
@@ -720,7 +719,7 @@ impl Player {
                     let runs = if c.runs_shaders() { pso } else { NONE };
                     let mut take = |before: bool, part: u32, spots: &[Spot], out: &mut Vec<Cmd>| {
                         let first = samples.len() as u64;
-                        self.take(spots, first, &states, &t, copied && !before, &mut scratch, out);
+                        self.take(spots, first, (&states, &t), copied && !before, &mut scratch, out);
                         samples.extend(spots.iter().map(|spot| Sample {
                             list: here,
                             command: n,

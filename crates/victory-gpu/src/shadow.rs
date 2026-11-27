@@ -113,7 +113,8 @@ struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    staging: CardStaging,
+    reserved: Option<Box<Mutex<crate::reserved_windows::Backing>>>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -134,6 +135,34 @@ struct Card {
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+enum CardStaging {
+    Shared(ID3D12Resource),
+    File(crate::card_staging::Backing),
+}
+
+impl Card {
+    fn note_touched(&self) {
+        if !self.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = self.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+
+    fn new(staging: CardStaging, size: u64) -> Self {
+        Self {
+            staging,
+            reserved: None,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: Default::default(),
+            me: Default::default(),
+            size,
+        }
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -383,8 +412,7 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
+fn card_for(size: u64, there: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
     }
@@ -495,7 +523,8 @@ fn window_card_most() -> u64 {
     *MOST.get_or_init(|| {
         let asked = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         let budget = || crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let mb = asked.unwrap_or_else(|| default_window_card_mb(budget()));
+        // File staging opts into loose windows by an explicit nonzero budget.
+        let mb = asked.unwrap_or_else(|| if crate::card_staging::directory().is_some() { 0 } else { default_window_card_mb(budget()) });
         tracing::info!(window_card_mb = mb, asked = asked.is_some(), "card room for windows");
         mb << 20
     })
@@ -516,11 +545,13 @@ fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+static WINDOW_FILE_STAGING: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+pub(crate) static RESERVED_WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = window_room_for(size);
+fn window_card_for(size: u64, there: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
     if there.is_some() || !windows_own() || !cards() {
         return there;
     }
@@ -590,7 +621,7 @@ fn windows_own() -> bool {
 }
 
 /// [`window_card_for`] in the card's own memory.
-fn window_room_for(size: u64) -> Option<ID3D12Resource> {
+fn window_room_for(size: u64, allocate: impl FnOnce(&crate::host::Host) -> Option<ID3D12Resource>) -> Option<ID3D12Resource> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -608,7 +639,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = allocate(host);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
@@ -671,7 +702,7 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(host: &crate::host::Host, sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out: Vec<(Arc<Shadow>, Vec<(usize, usize)>)> = Vec::new();
     let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     touched.sort_unstable_by_key(|weak| weak.as_ptr() as usize);
@@ -687,11 +718,25 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
+                let mut ranges = joined(std::mem::take(&mut *dirty));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
                     sent.note_joined(sent_as, ranges.clone());
+                }
+                drop(dirty);
+                if let Some(reserved) = &c.reserved {
+                    let mut backing = reserved.lock().unwrap_or_else(|e| e.into_inner());
+                    for &(from, to) in &ranges {
+                        backing.request(from, to, crate::reserved_windows::RequestSource::Dirty);
+                    }
+                    // Mapping and uploads are serialized under the direct submission lock.
+                    // Initialize new full tiles only; existing tiles can contain GPU writes.
+                    let new_tiles = host.map_window_tiles(&mut backing, &shadow.buffer)
+                        .unwrap_or_else(|e| crate::host::fail(format_args!("could not map a reserved window: {e}")));
+                    if !new_tiles.is_empty() {
+                        crate::host::join_ranges(&mut ranges, new_tiles);
+                    }
                 }
                 ranges
             })
@@ -2315,7 +2360,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -2700,6 +2745,13 @@ impl Drop for Shadow {
         }
         if let Some(card) = &mut self.card {
             if window {
+                #[cfg(feature = "diagnostics")]
+                if card.reserved.is_some() {
+                    RESERVED_WINDOW_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                }
+                if matches!(card.staging, CardStaging::File(_)) {
+                    WINDOW_FILE_STAGING.fetch_sub(card.size, Ordering::Relaxed);
+                }
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
@@ -3153,7 +3205,18 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.refresh_with_source(list, address, len, crate::reserved_windows::RequestSource::Refresh);
+    }
+
+    pub(crate) fn refresh_with_source(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        source: crate::reserved_windows::RequestSource,
+    ) {
         let len = len.min(self.start + self.len - address);
+        self.require_gpu_offsets(address.saturating_sub(self.start), (address + len).saturating_sub(self.start), source);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -3226,6 +3289,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.require_full_gpu_backing(crate::reserved_windows::RequestSource::GpuWrite);
         // Write-combined title memory, which the title's CPU does not read
         // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
         // which the CPU would read through the bus): what shaders write stays
@@ -4333,6 +4397,23 @@ impl Shadow {
         self.card.is_some()
     }
 
+    pub(crate) fn has_reserved_backing(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.reserved.is_some())
+    }
+
+    pub(crate) fn require_gpu_offsets(&self, from: u64, to: u64, source: crate::reserved_windows::RequestSource) {
+        if let Some(card) = &self.card
+            && let Some(reserved) = &card.reserved
+            && reserved.lock().unwrap_or_else(|e| e.into_inner()).request(from.min(self.len) as usize, to.min(self.len) as usize, source)
+        {
+            card.note_touched();
+        }
+    }
+
+    pub(crate) fn require_full_gpu_backing(&self, source: crate::reserved_windows::RequestSource) {
+        self.require_gpu_offsets(0, self.len, source);
+    }
+
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
@@ -4367,11 +4448,7 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        if !card.touched.swap(true, Ordering::AcqRel)
-            && let Some(me) = card.me.get()
-        {
-            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
-        }
+        card.note_touched();
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4428,10 +4505,28 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        let staging = match &card.staging {
+            CardStaging::Shared(buffer) => Some(buffer),
+            CardStaging::File(_) => None,
+        };
+        Some((staging, before, card.size))
+    }
+
+    /// Gets the mapped file's bytes for upload on the direct queue.
+    ///
+    /// SAFETY: the caller holds the submission lock while it reads. No
+    /// other thread or GPU operation may change these bytes in that time.
+    pub(crate) unsafe fn file_staging_bytes(&self, from: usize, to: usize) -> Option<&[u8]> {
+        let CardStaging::File(backing) = &self.card.as_ref()?.staging else { return None };
+        let len = to.checked_sub(from)?;
+        debug_assert!(to <= self.len as usize);
+        if to > self.len as usize { return None; }
+        // SAFETY: the live backing covers the checked range, and the caller
+        // synchronizes CPU users by the submission lock.
+        Some(unsafe { std::slice::from_raw_parts(backing.data().add(from), len) })
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4663,7 +4758,8 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                staging: CardStaging::Shared(none()),
+                reserved: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -4820,7 +4916,8 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: super::CardStaging::Shared(buffer),
+            reserved: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -4965,7 +5062,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -5139,7 +5236,22 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, Lookup::Range)
+}
+
+pub(crate) fn find_descriptor(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    lookup(address, len, false, Lookup::Descriptor)
+}
+
+pub(crate) fn find_root_cbv(address: u64) -> Option<Arc<Shadow>> {
+    lookup(address, 1, false, Lookup::RootCbv)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Lookup {
+    Range,
+    Descriptor,
+    RootCbv,
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -5164,7 +5276,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, Lookup::Range)
 }
 
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
@@ -5173,7 +5285,7 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+fn lookup(address: u64, len: u64, any: bool, caller: Lookup) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5193,7 +5305,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return loose(address, end, len <= 1, any, caller);
             }
         }
     }
@@ -5206,7 +5318,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, caller);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5252,31 +5364,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
+        let (buffer, data, card) = registered_backing(key.0, len, size, big)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
@@ -5301,6 +5389,38 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+fn registered_backing(start: u64, len: u64, size: u64, big: bool) -> Option<(ID3D12Resource, *mut u8, Option<Card>)> {
+    let directory = big.then(crate::card_staging::directory).flatten();
+    let mut admitted = directory.map(|_| card_room_for(size));
+    if let Some(directory) = directory && admitted.as_ref().is_some_and(Option::is_some) {
+        match crate::card_staging::Backing::new(directory, size as usize) {
+            Ok(backing) => {
+                let buffer = admitted.take()??;
+                crate::host::name(&buffer, || format!("title buffer {start:#x}+{len:#x} on the card"));
+                let data = backing.data();
+                static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                ANNOUNCED.call_once(|| tracing::info!("registered card buffers use file-backed CPU staging"));
+                return Some((buffer, data, Some(Card::new(CardStaging::File(backing), size))));
+            }
+            Err(error) => tracing::warn!(%error, size, "could not map card staging file; using a shared buffer"),
+        }
+    }
+    let Some((shared, data)) = host().and_then(|host| host.shared_buffer(size)) else {
+        if admitted.is_some_and(|buffer| buffer.is_some()) { CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed); }
+        return None;
+    };
+    crate::host::name(&shared, || format!("title buffer {start:#x}+{len:#x}"));
+    let on_card = card_for(size, admitted.unwrap_or_else(|| card_room_for(size)));
+    let (buffer, card) = match on_card {
+        Some(buffer) => {
+            crate::host::name(&buffer, || format!("title buffer {start:#x}+{len:#x} on the card"));
+            (buffer, Some(Card::new(CardStaging::Shared(shared), size)))
+        }
+        None => (shared, None),
+    };
+    Some((buffer, data, card))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -5494,7 +5614,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: CardStaging::Shared(staging),
+        reserved: None,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5510,7 +5631,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, caller: Lookup) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
@@ -5528,6 +5649,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
         if unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+        if shadow.has_reserved_backing() && caller != Lookup::RootCbv {
+            if unsized_ask {
+                shadow.require_full_gpu_backing(crate::reserved_windows::RequestSource::RootOrUnsized);
+            } else if caller != Lookup::Descriptor {
+                shadow.require_gpu_offsets(address - shadow.start, end - shadow.start, crate::reserved_windows::RequestSource::SizedLookup);
+            }
         }
     };
     // The window is there already (nearly always): readers share the lock.
@@ -5576,26 +5704,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                size: len,
-            };
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
-    };
+    let (buffer, data, card) = window_backing(start, len, !unsized_ask && caller == Lookup::Descriptor)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
@@ -5613,6 +5722,61 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// File staging is used only for windows admitted to card memory.
+fn window_backing(start: u64, len: u64, sparse_candidate: bool) -> Option<(ID3D12Resource, *mut u8, Option<Card>)> {
+    let directory = crate::card_staging::directory();
+    let mut sparse = None;
+    let mut admitted = directory.map(|_| window_room_for(len, |host| {
+        if sparse_candidate && host.reserved_window_buffers() {
+            match crate::reserved_windows::Backing::new(&host.device, len) {
+                Ok((buffer, backing)) => { sparse = Some(backing); return Some(buffer); }
+                Err(error) => tracing::warn!(%error, len, "reserved buffer unavailable; using a committed buffer"),
+            }
+        }
+        host.uav_buffer(len)
+    }));
+    if let Some(directory) = directory && admitted.as_ref().is_some_and(Option::is_some) {
+        match crate::card_staging::Backing::new(directory, len as usize) {
+            Ok(backing) => {
+                let buffer = admitted.take()??;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let data = backing.data();
+                if WINDOW_FILE_STAGING.fetch_add(len, Ordering::Relaxed) == 0 {
+                    tracing::info!("loose card windows use file-backed CPU staging");
+                }
+                let mut card = Card::new(CardStaging::File(backing), len);
+                card.reserved = sparse.map(|backing| Box::new(Mutex::new(backing)));
+                #[cfg(feature = "diagnostics")]
+                if card.reserved.is_some() { RESERVED_WINDOW_BYTES.fetch_add(len, Ordering::Relaxed); }
+                return Some((buffer, data, Some(card)));
+            }
+            Err(error) => tracing::warn!(%error, len, "could not map card window staging file; using a shared buffer"),
+        }
+    }
+    // A reserved resource requires file-backed staging and tracked tiles.
+    // If file creation failed, drop it and release its admission before
+    // taking the ordinary shared-buffer fallback.
+    if sparse.take().is_some() && admitted.take().is_some_and(|buffer| buffer.is_some()) {
+        WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+    }
+    let Some((shared, data)) = host().and_then(|host| host.shared_buffer(len)) else {
+        if admitted.is_some_and(|buffer| buffer.is_some()) {
+            WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        return None;
+    };
+    crate::host::name(&shared, || format!("title memory {start:#x}+{len:#x}"));
+    let on_card = window_card_for(len, admitted.unwrap_or_else(|| window_room_for(len, |host| host.uav_buffer(len))));
+    let (buffer, card) = match on_card {
+        Some(buffer) => {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} on the card"));
+            (buffer, Some(Card::new(CardStaging::Shared(shared), len)))
+        }
+        None => (shared, None),
+    };
+    Some((buffer, data, card))
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,

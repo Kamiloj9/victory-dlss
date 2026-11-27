@@ -51,12 +51,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
-/// The fork's offline warm-up (`victory translate --warm`), by
-/// [`precompile`]: whether it was translated now.
+/// The offline warm-up (`victory translate --warm`): whether the shader
+/// was translated now for the requested target.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
+        victory_gpu::shader_cache::warm(container)
     }
     #[cfg(not(windows))]
     {
