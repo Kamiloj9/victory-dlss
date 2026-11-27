@@ -5694,7 +5694,7 @@ mod tests {
     }
 
     /// The table of the first review, plus the counterexample it found: 100
-    /// bytes of buffer, an offset of 112 â€” the clamp this replaced viewed bytes
+    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
     /// 96 to 99, which the request had asked nothing about.
     #[test]
     fn the_range_stays_inside_the_buffer() {

@@ -282,7 +282,7 @@ type FreeRoutine = extern "system" fn(*mut c_void, u64);
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
-/// the `â€¦Default` exports do not.
+/// the `…Default` exports do not.
 fn hooks() -> [usize; 2] {
     static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let at = match AT.get() {
@@ -1326,7 +1326,9 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     // into that gap (`victory_gpu::title_memory_remapping`). Taken before
     // the views, as everywhere: a reader that holds it may fault into a
     // lazy view and need the views to make it real ([`materialize`]).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_with_extent(|| {
+        mapping_extent(&physical(), base, n.checked_mul(PAGE)?)
+    });
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
@@ -1427,7 +1429,7 @@ fn alias_as(to: u64, from: u64, len: u64, runs_in_one: bool, lazy: bool) -> bool
     let _busy = Busy::begin();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap (taken
     // before the views, as there).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_with_extent(|| mapping_extent(&physical(), to, len));
     let mut physical = physical();
     unmap(&mut physical, to, len);
     if from == 0 {
@@ -1598,7 +1600,9 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let mut at = 0;
     while at < pages.len() {
         let _busy = Busy::begin();
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_with_extent(|| {
+            group_extent(pages[at..].iter().take(GROUP).map(|&(to, _)| to))
+        });
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
@@ -1628,7 +1632,9 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         let _busy = Busy::begin();
         let mut costed = Costed::begin(None);
         let mut ops: Vec<Op> = Vec::new();
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_with_extent(|| {
+            group_extent(wanted[at..].iter().take(GROUP).map(|&(to, _)| to))
+        });
         let mut physical = physical();
         if let Some(costed) = &mut costed {
             costed.waited = costed.started.elapsed().as_nanos() as u64;
@@ -2129,6 +2135,49 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// A group can stop early on a duplicate or a dependency. Reserving the
+/// bounding interval of all its candidate pages covers every actual change.
+fn group_extent(mut pages: impl Iterator<Item = usize>) -> Option<(usize, usize)> {
+    let first = pages.next()?;
+    let mut low = first;
+    let mut high = first;
+    for page in pages {
+        if !page.is_multiple_of(PAGE) {
+            return None;
+        }
+        low = low.min(page);
+        high = high.max(page);
+    }
+    if !first.is_multiple_of(PAGE) {
+        return None;
+    }
+    mapping_extent(&physical(), low, high.checked_add(PAGE)?.checked_sub(low)?)
+}
+
+/// The full views `unmap` temporarily takes away, including their parts
+/// outside the requested range. Overflow or an empty range stays global.
+fn mapping_extent(physical: &Physical, base: usize, len: usize) -> Option<(usize, usize)> {
+    if len == 0 || !base.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+        return None;
+    }
+    let end = base.checked_add(len)?;
+    let mut low = base;
+    let mut high = end;
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back() {
+        let view_end = at.checked_add(size)?;
+        if view_end > base {
+            low = at;
+            high = high.max(view_end);
+        }
+    }
+    // Views do not overlap, so only the last view starting inside the
+    // request can extend beyond its end.
+    if let Some((&at, &(size, _))) = physical.views.range(base..end).next_back() {
+        high = high.max(at.checked_add(size)?);
+    }
+    Some((low, high.checked_sub(low)?))
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -2970,6 +3019,55 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn mapping_extent_includes_the_entire_old_view() {
+        let mut pages = [0usize; 3];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, 3, pages.as_ptr()), base);
+        let extent = mapping_extent(&physical(), base as usize + PAGE, PAGE);
+        assert_eq!(extent, Some((base as usize, 3 * PAGE)));
+        assert_eq!(mapping_extent(&physical(), base as usize + 1, PAGE), None);
+        assert_eq!(mapping_extent(&physical(), base as usize, PAGE - 1), None);
+        assert_eq!(mapping_extent(&physical(), usize::MAX - PAGE + 1, PAGE), None);
+        assert_eq!(XMemMapPhysicalPages(base, 3, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn remapping_middle_waits_for_reader_of_old_view_edge() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut pages = [0usize; 3];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        assert_eq!(map_pages(base, 3, pages.as_ptr(), true), base);
+        let reader = victory_gpu::title_memory_reading_range(base as usize, 1);
+        let (started, wait_started) = mpsc::channel();
+        let (finished, wait_finished) = mpsc::channel();
+        let middle = base as usize + PAGE;
+        let page = pages[1];
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = XMemMapPhysicalPages(middle as *mut c_void, 1, &page);
+            finished.send(result as usize).unwrap();
+        });
+        wait_started.recv().unwrap();
+        assert!(wait_finished.recv_timeout(Duration::from_millis(100)).is_err());
+        // The overlapping writer must wait without the table lock: this
+        // range reader needs that table to turn its lazy view into a host view.
+        assert!(materialize(base as usize, 1));
+        drop(reader);
+        assert_eq!(wait_finished.recv_timeout(Duration::from_secs(3)).unwrap(), middle);
+        writer.join().unwrap();
+        assert_eq!(XMemMapPhysicalPages(base, 3, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]

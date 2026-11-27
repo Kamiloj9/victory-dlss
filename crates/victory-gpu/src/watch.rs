@@ -2624,6 +2624,72 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// ([`title_memory_remapping`]).
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
+/// An inclusive address interval. Invalid extents intersect every reader.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MappingRange {
+    first: usize,
+    last: usize,
+}
+
+impl MappingRange {
+    fn new(at: usize, len: usize) -> Self {
+        match at.checked_add(len).filter(|&end| end > at) {
+            Some(end) => Self { first: at, last: end - 1 },
+            None => Self::ALL,
+        }
+    }
+
+    const ALL: Self = Self { first: 0, last: usize::MAX };
+
+    fn overlaps(self, other: Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+}
+
+struct MappingRanges {
+    readers: Vec<MappingRange>,
+    writer: Option<MappingRange>,
+}
+
+static RANGES: Mutex<MappingRanges> = Mutex::new(MappingRanges { readers: Vec::new(), writer: None });
+static RANGE_CHANGED: Condvar = Condvar::new();
+
+fn mapping_state() -> std::sync::MutexGuard<'static, MappingRanges> {
+    RANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn range_reader(at: usize, len: usize, wait: bool) -> Option<Reading> {
+    let range = MappingRange::new(at, len);
+    let mut state = if wait {
+        mapping_state()
+    } else {
+        match RANGES.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    while state.writer.is_some_and(|changing| changing.overlaps(range)) {
+        if !wait {
+            return None;
+        }
+        state = RANGE_CHANGED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    state.readers.push(range);
+    Some(Reading(ReadingScope::Range(range)))
+}
+
+/// Pins the mapping of exactly the bytes the caller will access.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    range_reader(at, len, true).expect("blocking range read")
+}
+
+#[cfg(test)]
+fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> {
+    range_reader(at, len, false)
+}
+
+
 impl Drop for Remapping {
     fn drop(&mut self) {
         // The change is done: what is there now may be guarded.
@@ -2631,6 +2697,8 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        mapping_state().writer = None;
+        RANGE_CHANGED.notify_all();
     }
 }
 
@@ -2769,6 +2837,13 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_with_extent(|| None)
+}
+
+/// Compute the complete affected VA range while mapping writers are serialized.
+/// The closure must release the view table before returning: an outstanding
+/// reader can need that table to materialize a lazy view. None reserves every VA.
+pub fn title_memory_remapping_with_extent(extent: impl FnOnce() -> Option<(usize, usize)>) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2780,20 +2855,45 @@ pub fn title_memory_remapping() -> Remapping {
         }
     }
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let range = extent().map_or(MappingRange::ALL, |(at, len)| MappingRange::new(at, len));
+    let mut state = mapping_state();
+    state.writer = Some(range);
+    while state.readers.iter().any(|reader| reader.overlaps(range)) {
+        state = RANGE_CHANGED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(state);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(ReadingScope);
+
+enum ReadingScope {
+    Global(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Range(MappingRange),
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let ReadingScope::Range(range) = self.0 {
+            let mut state = mapping_state();
+            let index = state.readers.iter().position(|&reader| reader == range).expect("registered reader");
+            state.readers.swap_remove(index);
+            if state.writer.is_some_and(|writer| writer.overlaps(range)) {
+                RANGE_CHANGED.notify_all();
+            }
+        }
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    Reading(ReadingScope::Global(MAPPING.read().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -2801,8 +2901,8 @@ pub fn title_memory_reading() -> Reading {
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(ReadingScope::Global(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(ReadingScope::Global(e.into_inner()))),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
@@ -4748,11 +4848,52 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn disjoint_reader_can_run_while_a_range_is_remapped() {
+        let _serial = SERIAL.lock().unwrap();
+        let _writer = super::title_memory_remapping_with_extent(|| Some((0x10000, 0x1000)));
+        assert!(super::title_memory_reading_range_now(0x20000, 0x1000).is_some());
+        assert!(super::title_memory_reading_range_now(0x10800, 1).is_none());
+        assert!(super::title_memory_reading_now().is_none());
+        assert!(super::title_memory_reading_range_now(usize::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn nonblocking_read_does_not_wait_for_registry_mutex() {
+        let _serial = SERIAL.lock().unwrap();
+        let _registry = super::mapping_state();
+        assert!(super::title_memory_reading_range_now(0x20000, 0x1000).is_none());
+    }
+
+    #[test]
+    fn waiting_overlapping_writer_prevents_new_readers() {
+        let _serial = SERIAL.lock().unwrap();
+        let reader = super::title_memory_reading_range(0x30000, 0x1000);
+        let (started, wait) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let _writer = super::title_memory_remapping_with_extent(|| Some((0x30000, 0x1000)));
+        });
+        wait.recv().unwrap();
+        // Wait for the writer to register, rather than relying on scheduling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while super::mapping_state().writer != Some(super::MappingRange::new(0x30000, 0x1000)) {
+            assert!(std::time::Instant::now() < deadline, "writer failed to register");
+            std::thread::yield_now();
+        }
+        assert!(super::title_memory_reading_range_now(0x30000, 1).is_none());
+        assert!(super::title_memory_reading_range_now(0x40000, 1).is_some());
+        drop(reader);
+        thread.join().unwrap();
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = SERIAL.lock().unwrap();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
