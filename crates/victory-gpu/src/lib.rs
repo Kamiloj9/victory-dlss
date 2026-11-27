@@ -99,6 +99,8 @@ mod ab;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub use texture::note_file_backed_title_pages;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;

@@ -401,11 +401,11 @@ fn fill_unlocked() -> bool {
 /// got less than was mapped (their slots are looked at again).
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Since the last frame-rate line, exact refreshes (for a bake) that found
+/// Since the last frame-rate line, complete refreshes that found
 /// the runtime remapping title memory ([`exact_unlocked`]): read whole
 /// through the kernel without waiting, and those that had to wait (a page
 /// was not there).
-pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static COMPLETE_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether an exact refresh (the uploads before a bake, `BAKING`) that
 /// finds the runtime remapping title memory first reads the texture whole
@@ -420,6 +420,52 @@ pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { s
 fn exact_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_NO_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Native file-backed physical pages can make changes to the title's mappings expensive.
+static FILE_BACKED_PHYSICAL_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime successfully opened file-backed physical memory for this title.
+pub fn note_file_backed_title_pages() {
+    FILE_BACKED_PHYSICAL_PAGES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The kernel checks the full range and returns a byte count. A partial copy
+/// remains private until the caller retries under the mapping lock.
+fn read_native_texture(src: *const u8, bytes: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
+    let mut got = 0;
+    // SAFETY: the kernel validates the source; the destination is the entire writable slice.
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), bytes.as_mut_ptr().cast(), bytes.len(), &mut got) != 0 && got == bytes.len()
+    }
+}
+
+/// Read every source byte before publishing the hash or updating staging.
+/// A failed read can modify its scratch prefix; the caller retries under the mapping lock.
+fn complete_texture_read(
+    src: *const u8,
+    size: usize,
+    last: &mut Last,
+    read_all: fn(*const u8, &mut [u8]) -> bool,
+    update: impl FnOnce(&[u8]),
+) -> Option<bool> {
+    with_read(size, |read| {
+        if !read_all(src, read) {
+            return None;
+        }
+        let hash = digest(read);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        if last.hash == Some(hash) {
+            return Some(false);
+        }
+        last.hash = Some(hash);
+        update(read);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        Some(true)
+    })
 }
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
@@ -1521,18 +1567,24 @@ impl Staging {
                 return self.refresh_unlocked(last, size);
             };
             mapped
-        } else if exact && exact_unlocked() {
+        } else if (exact && exact_unlocked()) || (!exact && FILE_BACKED_PHYSICAL_PAGES.load(std::sync::atomic::Ordering::Relaxed)) {
             match crate::watch::title_memory_reading_now() {
                 Some(mapped) => mapped,
-                None => match self.refresh_exact_unlocked(last, size) {
-                    Some(read) => {
-                        if read {
-                            found_blind(last);
+                None => {
+                    // A software-only view lives in XMem's page table; the runtime knows how to read it.
+                    let reader = if exact || crate::watch::soft().is_some() { crate::host::read_into } else { read_native_texture };
+                    let complete = complete_texture_read(self.memory, size, last, reader, |bytes| self.detile(bytes));
+                    COMPLETE_UNLOCKED[usize::from(complete.is_none())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match complete {
+                        Some(changed) => {
+                            if changed {
+                                found_blind(last);
+                            }
+                            return size;
                         }
-                        return size;
+                        None => waited(2, crate::watch::title_memory_reading),
                     }
-                    None => waited(2, crate::watch::title_memory_reading),
-                },
+                }
             }
         } else {
             waited(2, crate::watch::title_memory_reading)
@@ -1641,32 +1693,6 @@ impl Staging {
             last.asked = 0;
             0
         }
-    }
-
-    /// An exact refresh (for a bake) that finds the runtime remapping
-    /// title memory ([`exact_unlocked`]): the texture is read whole through
-    /// the kernel, which needs no lock and fails if a page of it is not
-    /// there; read, it is what title memory holds now, as a read under the
-    /// lock would be. `Some(changed)` if read (and detiled if it changed),
-    /// `None` if a page was missing: then the refresh waits for the lock
-    /// as before.
-    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize) -> Option<bool> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut changed = false;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-                changed = true;
-            }
-            true
-        });
-        EXACT_UNLOCKED[usize::from(!read)].fetch_add(1, Relaxed);
-        read.then_some(changed)
     }
 
     /// The first filling of the staging buffer while the runtime is
@@ -2230,6 +2256,40 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn complete_reads_during_a_remap_publish_only_fully_readable_textures() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: reserve two private pages, initially commit and fill only the first.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) }.cast::<u8>();
+        assert!(!at.is_null());
+        let mut last = super::Last::default();
+        unsafe {
+            assert_eq!(VirtualAlloc(at.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), at.cast());
+            at.write_bytes(0x5a, PAGE);
+        }
+        let mut uploaded = Vec::new();
+        {
+            let _remapping = crate::watch::title_memory_remapping();
+            assert!(crate::watch::title_memory_reading_now().is_none());
+            assert_eq!(super::complete_texture_read(at, PAGE, &mut last, super::read_native_texture, |b| uploaded.extend_from_slice(b)), Some(true));
+            assert_eq!(uploaded, vec![0x5a; PAGE]);
+            let original = last.hash;
+            assert_eq!(super::complete_texture_read(at, 2 * PAGE, &mut last, super::read_native_texture, |_| panic!("partial upload")), None);
+            assert_eq!(last.hash, original);
+            assert_eq!(super::complete_texture_read(at, PAGE, &mut last, super::read_native_texture, |_| panic!("unchanged upload")), Some(false));
+        }
+        // SAFETY: the remaining page belongs to this private allocation.
+        unsafe {
+            assert_eq!(VirtualAlloc(at.add(PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), at.add(PAGE).cast());
+            at.add(PAGE).write_bytes(0x27, PAGE);
+        }
+        // The full retry must publish the newly accessible tail.
+        assert_eq!(super::complete_texture_read(at, 2 * PAGE, &mut last, super::read_native_texture, |b| uploaded = b.to_vec()), Some(true));
+        assert_eq!(&uploaded[PAGE..], vec![0x27; PAGE]);
+        unsafe { assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0) };
+    }
 
     /// Whether memory is all there is answered by the runtime's views of
     /// physical pages where they lie, and by Windows where none does.

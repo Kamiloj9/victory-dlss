@@ -282,7 +282,7 @@ type FreeRoutine = extern "system" fn(*mut c_void, u64);
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
-/// the `…Default` exports do not.
+/// the `â€¦Default` exports do not.
 fn hooks() -> [usize; 2] {
     static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let at = match AT.get() {
@@ -753,6 +753,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    if backing.is_some() {
+        victory_gpu::note_file_backed_title_pages();
+    }
     let section = Arc::new(Section {
         handle,
         backing,
