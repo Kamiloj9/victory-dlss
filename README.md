@@ -31,6 +31,25 @@ The first run can compile shaders and populate the cache. Benchmark runs
 used a preseeded cache and an external 8 GiB working-set cap. The launcher
 uses normal interactive input and omits benchmark capture and debug logging.
 
+### Manual first-mission result
+
+On November 27, 2026, a manual playthrough completed the first mission
+on an RTX 4080 SUPER (driver 621.14) using the release build from
+`01e4918c8`. The Foxhound launcher requested Series X at 2560x1440,
+DLSS Quality, and 2x Frame Generation (mode 1). The session log covers
+about 22 minutes and ends with a normal title shutdown.
+
+Across 243 in-game runtime samples with at least 500 draws per frame,
+the median base render rate was **18.0 FPS** (range 3.5 to 38.3 FPS).
+These are application log samples from one manual run. Completion was
+reported by the player, and generated display frames were not measured.
+
+```powershell
+./scripts/play-gta6-framegen.ps1 -GameDir 'D:\games\your-dump' -Mode 1
+```
+
+Foxhound writes a per-run log under `%LOCALAPPDATA%/victory/logs`.
+
 ## Frame generation: what your card supports
 
 | Your card | Frame generation | Limits |
