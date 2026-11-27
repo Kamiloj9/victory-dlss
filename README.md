@@ -30,6 +30,14 @@ remain unverified on this setup.
 | Reserved-window admission | At the 2 GiB limit, shared-window fallback allocations totaled 648 MiB by the last sample, which showed 20.7 MiB of mapped reserved tiles. At 3 GiB, shared-window fallback totaled zero through the last sample and mapped tiles reached 1,425 MiB. One 250 ms interval added 1,347 MiB of mapped tiles and 1,460 MiB of process private commit. |
 | Reserved D3D12 buffers | In a standalone probe on the same GPU, reserving 256 MiB of GPU address space left private commit unchanged. After allocating a 4 MiB heap and mapping its 64 tiles, private commit was 6.23 MiB above baseline. A 64 KiB GPU copy and readback matched. |
 
+On 2026-11-26, the comparison sampler, BC7 channel rotation, FMAC
+accumulator, and Wave64 scan fixes passed their regression tests. The
+matched synthetic D3D12 WARP comparisons used for those merges met the
+frame-time tolerance. The Series X comparison for PR #26 stopped at the
+Windows commit limit. Gameplay verification for both changes remains open.
+[Sampler and BC7, PR #26](https://github.com/Kamiloj9/victory-dlss/pull/26)
+· [FMAC and Wave64, PR #27](https://github.com/Kamiloj9/victory-dlss/pull/27)
+
 The two `f9fbd8d` runs used a 4 MiB window grid, a 1,536 MiB indexed
 texture budget, and experimental reserved buffers for some loose windows.
 The 2 GiB and 3 GiB runs began with 13.06 GiB and 13.73 GiB of available
